@@ -1,1208 +1,300 @@
 #!/usr/bin/env python3
+"""Reconstruction of the optimal Catalan-like polyhedra C(n) from their source fullerenes.
+
+For each admissible hexagon count n in the achievable set
+N = {20, 25} u {27, 28, ..., 52} u {55, 60}, the catalogue at the foot of this module
+records the isolated-pentagon-rule (IPR) fullerene C_{2n+20} whose associated
+polyhedron C(n) minimises the face-area ratio.  Executing the module reconstructs
+each optimal C(n) and writes it in Object File Format (OFF).
+
+The reconstruction proceeds in three stages.
+
+  1. Construction (pole contraction).  Given the face set of an IPR fullerene -- twelve
+     pairwise-disjoint pentagons and n hexagons -- each pentagon is contracted to a
+     single apex, a *pole* of degree five.  A hexagon incident to p of the pentagons
+     (with 0 <= p <= 3 under the isolated-pentagon rule) thereby loses p edges and
+     descends to a (6 - p)-gonal face, while the (6,6,6)-vertices of the fullerene are
+     retained with degree three.  The result is the abstract 3-polytope C(n).
+
+  2. Canonical (midsphere) realisation.  C(n) is realised with every edge tangent to the
+     unit sphere -- the Koebe-Andreev-Thurston midsphere form -- by the standard
+     alternating projection: each face is flattened onto its mean plane (face normals by
+     Newell's method), each edge is driven towards unit distance from the origin, and the
+     configuration is recentred on the centroid of the edge-sphere tangency points.  A
+     graph-Laplacian spectral embedding furnishes the initial immersion.
+
+  3. Invariant.  The face-area ratio rho = A_max / A_min >= 1 is read off; rho = 1
+     certifies an equiareal polyhedron.
+
+Usage
+-----
+    python3 catalan-like_generator.py            # reconstruct every n in the catalogue
+    python3 catalan-like_generator.py 29 60      # reconstruct selected n only
+
+Output
+------
+    ./best_offs/catalan_n<n>.off
+    
 """
-catalan-like_generator.py
-===================
-Generates valid n-faced Catalan-like polyhedra for n >= 27.
 
-Faces consist of near-regular hexagons, shields (irregular pentagons), rhombi/trapezoids & near-regular triangles.
-All non-pole vertices have degree 3; exactly 12 poles have degree 5.
-The Euler identity 2*n_quads + n_shields = 12 is automatically satisfied.
+from __future__ import annotations
 
-Algorithm:
-  1. Subdivision path k^2*(m+10)-10: exact and deterministic, tried first.
-  2. Anchor + edge-split: build a nearby subdivisible n', split k hex-hex edges.
-  3. Pure Thomson fallback with greedy edge flips and vertex-split repair.
-  4. Stabilisation: face planarity -> midsphere canonicalisation -> area equalization.
+import os
+import sys
+from collections import Counter
+from typing import Dict, List, Sequence, Tuple
 
-Usage:
-  python catalan-like_generator.py 400
-  python catalan-like_generator.py 1000 --output my_polyhedron.off
-  python catalan-like_generator.py 500 --no-stabilize
-"""
-
-import sys, os, time, argparse
 import numpy as np
-from scipy.optimize import minimize
-from scipy.spatial import ConvexHull
-from collections import defaultdict, Counter
+
+Face = Tuple[int, ...]
+Embedding = np.ndarray
 
 
-_PHI = (1 + np.sqrt(5)) / 2
-_ICO = np.array([
-    [0, 1, _PHI], [0, -1, _PHI], [0, 1, -_PHI], [0, -1, -_PHI],
-    [1, _PHI, 0], [-1, _PHI, 0], [1, -_PHI, 0], [-1, -_PHI, 0],
-    [_PHI, 0, 1], [-_PHI, 0, 1], [_PHI, 0, -1], [-_PHI, 0, -1],
-], dtype=np.float64)
-_ICO /= np.linalg.norm(_ICO[0])
+# ---------------------------------------------------------------------------
+# 1.  Construction: pole contraction of an IPR fullerene
+# ---------------------------------------------------------------------------
+
+def construct_polytope(fullerene_faces: Sequence[Sequence[int]]) -> Tuple[int, List[Face], int]:
+    """Return the abstract polytope C(n) obtained by contracting each pentagon to a pole.
+
+    The argument is the face set of an IPR fullerene, every face given as the cyclic
+    sequence of its vertices (pentagons of length five, hexagons of length six).  The
+    twelve pentagons are contracted to twelve poles, indexed 0..11; the remaining
+    (6,6,6)-vertices are reindexed consecutively from 12 onwards.  Each hexagon is
+    rewritten by replacing every pentagon-vertex with its pole and deleting the resulting
+    consecutive repetitions, which yields a simple (6 - p)-gon.
+
+    Returns the number of vertices, the faces of C(n), and the number of poles.
+    """
+    pentagons = [f for f in fullerene_faces if len(f) == 5]
+    hexagons = [f for f in fullerene_faces if len(f) == 6]
+
+    pole_of_vertex: Dict[int, int] = {}
+    for pole_index, pentagon in enumerate(pentagons):
+        for vertex in pentagon:
+            pole_of_vertex[vertex] = pole_index
+    n_poles = len(pentagons)
+
+    retained = sorted({v for f in fullerene_faces for v in f if v not in pole_of_vertex})
+    new_index = {v: n_poles + i for i, v in enumerate(retained)}
+
+    faces: List[Face] = []
+    for hexagon in hexagons:
+        sequence: List[Tuple[str, int]] = []
+        for vertex in hexagon:
+            token = ('pole', pole_of_vertex[vertex]) if vertex in pole_of_vertex else ('vertex', vertex)
+            if not sequence or sequence[-1] != token:
+                sequence.append(token)
+        if len(sequence) > 1 and sequence[0] == sequence[-1]:
+            sequence.pop()
+        faces.append(tuple(ref if kind == 'pole' else new_index[ref] for kind, ref in sequence))
+
+    n_vertices = n_poles + len(retained)
+    return n_vertices, faces, n_poles
 
 
-def fibonacci_sphere(n, seed=0):
-    rng = np.random.RandomState(seed)
-    phi_g = (1 + np.sqrt(5)) / 2
-    pts = []
-    for i in range(n):
-        theta = np.arccos(max(-1.0, min(1.0, 1 - 2*(i+0.5)/n)))
-        phi_i = 2*np.pi*i / phi_g
-        pts.append([np.sin(theta)*np.cos(phi_i),
-                    np.sin(theta)*np.sin(phi_i),
-                    np.cos(theta)])
-    pts = np.array(pts) + rng.randn(n, 3) * 0.01
-    pts /= np.linalg.norm(pts, axis=1, keepdims=True)
-    return pts
+# ---------------------------------------------------------------------------
+# Combinatorial helpers
+# ---------------------------------------------------------------------------
 
+def faces_by_size_and_edges(faces: Sequence[Face]) -> Tuple[Dict[int, np.ndarray], np.ndarray]:
+    """Group faces by vertex count and enumerate the undirected edges.
 
-def thomson(pts, n_iter=500):
-    nv = len(pts)
-    def eg(x):
-        p = x.reshape(nv, 3)
-        p = p / np.linalg.norm(p, axis=1, keepdims=True)
-        d = p[:, None] - p[None]
-        r2 = np.sum(d**2, axis=2); np.fill_diagonal(r2, 1.0)
-        r = np.sqrt(r2); r3 = r2 * r
-        E = np.sum(1.0/r) / 2
-        G = (-d / r3[:,:,None]).sum(1)
-        G -= np.sum(G*p, axis=1, keepdims=True) * p
-        return E, G.flatten()
-    res = minimize(eg, pts.flatten(), jac=True, method='L-BFGS-B',
-                   options={'maxiter': n_iter, 'ftol': 1e-15, 'gtol': 1e-10})
-    p = res.x.reshape(nv, 3)
-    return p / np.linalg.norm(p, axis=1, keepdims=True)
+    Returns a dictionary sending each face size s to the (m_s, s) integer matrix of the
+    m_s faces of that size, together with the (E, 2) array of edges (a, b), a < b.
+    """
+    by_size: Dict[int, List[List[int]]] = {}
+    for face in faces:
+        by_size.setdefault(len(face), []).append(list(face))
+    grouped = {size: np.array(rows, dtype=int) for size, rows in by_size.items()}
 
-
-def triangulate(pts):
-    hull = ConvexHull(pts); cen = pts.mean(0); tris = []
-    for tri in hull.simplices:
-        v0, v1, v2 = pts[tri[0]], pts[tri[1]], pts[tri[2]]
-        if np.dot(np.cross(v1-v0, v2-v0), (v0+v1+v2)/3 - cen) < 0:
-            tris.append([tri[0], tri[2], tri[1]])
-        else:
-            tris.append(list(tri))
-    return tris
-
-
-def spring_relax(pts, tris, n_iter=200):
-    n = len(pts)
-    seen = set(); eu = []; ev = []
-    for t in tris:
-        for j in range(3):
-            e = (min(t[j], t[(j+1)%3]), max(t[j], t[(j+1)%3]))
-            if e not in seen:
-                seen.add(e); eu.append(e[0]); ev.append(e[1])
-    eu = np.array(eu); ev = np.array(ev)
-    L0 = np.mean(np.linalg.norm(pts[eu] - pts[ev], axis=1))
-    for _ in range(n_iter):
-        diff = pts[ev] - pts[eu]; L = np.linalg.norm(diff, axis=1, keepdims=True)
-        f = (L - L0) * diff / (L + 1e-12); Fi = np.zeros((n, 3))
-        np.add.at(Fi, eu, f); np.add.at(Fi, ev, -f)
-        Fi -= np.sum(Fi*pts, axis=1, keepdims=True) * pts
-        pts = pts + 0.008*Fi
-        pts /= np.linalg.norm(pts, axis=1, keepdims=True)
-    return pts
-
-
-def _pen(d):
-    if d in (5, 6): return 0
-    if d in (4, 7): return 50
-    return 500
-
-
-def _build_mesh(tris):
-    ef = defaultdict(list); deg = Counter(); ve = defaultdict(set)
-    for t in tris:
-        for v in t: deg[v] += 1
-    for ti, t in enumerate(tris):
-        for j in range(3):
-            e = (min(t[j], t[(j+1)%3]), max(t[j], t[(j+1)%3]))
-            ef[e].append(ti); ve[e[0]].add(e); ve[e[1]].add(e)
-    return ef, deg, ve
-
-
-def _score(deg, ef):
-    sc = sum(_pen(d) for d in deg.values())
-    for e, fis in ef.items():
-        if fis and deg[e[0]] == 5 and deg[e[1]] == 5:
-            sc += 100
-    return sc
-
-
-def flip_pass(n, tris, rng):
-    ef, deg, ve = _build_mesh(tris)
-    keys = list(ef.keys())
-    for e_idx in rng.permutation(len(keys)):
-        if e_idx >= len(keys): continue
-        ek = keys[e_idx]
-        fis = ef.get(ek, [])
-        if len(fis) != 2: continue
-        ti0, ti1 = fis; t0, t1 = tris[ti0], tris[ti1]
-        cl = [v for v in t0 if v != ek[0] and v != ek[1]]
-        dl = [v for v in t1 if v != ek[0] and v != ek[1]]
-        if not cl or not dl or cl[0] == dl[0]: continue
-        c, d = cl[0], dl[0]; a, b = ek
-
-        def pa(a, b, c, d):
-            na, nb, nc, nd = deg[a]-1, deg[b]-1, deg[c]+1, deg[d]+1
-            sc = _pen(na)+_pen(nb)+_pen(nc)+_pen(nd)
-            if nc == 5 and nd == 5: sc += 100
-            if na == 5:
-                for e2 in ve[a]:
-                    u = e2[0] if e2[1] == a else e2[1]
-                    if u != b and u != c and u != d and deg[u] == 5: sc += 100
-                if nc == 5: sc += 100
-                if nd == 5: sc += 100
-            if nb == 5:
-                for e2 in ve[b]:
-                    u = e2[0] if e2[1] == b else e2[1]
-                    if u != a and u != c and u != d and deg[u] == 5: sc += 100
-                if nc == 5: sc += 100
-                if nd == 5: sc += 100
-            if nc == 5:
-                for e2 in ve[c]:
-                    u = e2[0] if e2[1] == c else e2[1]
-                    if u != a and u != b and deg[u] == 5: sc += 100
-            if nd == 5:
-                for e2 in ve[d]:
-                    u = e2[0] if e2[1] == d else e2[1]
-                    if u != a and u != b and deg[u] == 5: sc += 100
-            return sc
-
-        def pb(a, b, c, d):
-            sc = _pen(deg[a])+_pen(deg[b])+_pen(deg[c])+_pen(deg[d])
-            if deg[a] == 5 and deg[b] == 5: sc += 100
-            return sc
-
-        if pa(a, b, c, d) <= pb(a, b, c, d):
-            for ti, tri in [(ti0, t0), (ti1, t1)]:
-                for j in range(3):
-                    oe = (min(tri[j],tri[(j+1)%3]), max(tri[j],tri[(j+1)%3]))
-                    if ti in ef[oe]: ef[oe].remove(ti)
-                    ve[tri[j]].discard(oe); ve[tri[(j+1)%3]].discard(oe)
-            nt0 = [a,c,d]; nt1 = [b,d,c]
-            tris[ti0] = nt0; tris[ti1] = nt1
-            for ti, tri in [(ti0,nt0),(ti1,nt1)]:
-                for j in range(3):
-                    ne = (min(tri[j],tri[(j+1)%3]), max(tri[j],tri[(j+1)%3]))
-                    ef[ne].append(ti); ve[tri[j]].add(ne); ve[tri[(j+1)%3]].add(ne)
-            deg[a] -= 1; deg[b] -= 1; deg[c] += 1; deg[d] += 1
-            keys = list(ef.keys())
-    return tris, _score(deg, ef), dict(deg)
-
-
-def vertex_split_repair(pts, tris, deg_map, rng, verbose=False):
-    """Inject one vertex on an edge adjacent to the worst bad vertex, then
-    flip-pass to restore score=0. Returns (pts_new, tris_new, score_new)."""
-    bad = [v for v, d in deg_map.items() if d not in (4, 5, 6)]
-    if not bad:
-        return pts, tris, _score(*_build_mesh(tris)[:2])
-
-    bad_v = max(bad, key=lambda v: abs(deg_map[v] - 6))
-
-    ef = defaultdict(list)
-    for ti, t in enumerate(tris):
-        for j in range(3):
-            e = (min(t[j], t[(j+1)%3]), max(t[j], t[(j+1)%3]))
-            ef[e].append(ti)
-
-    candidates = [(e, fis) for e, fis in ef.items()
-                  if bad_v in e and len(fis) == 2]
-    if not candidates:
-        return pts, tris, _score(*_build_mesh(tris)[:2])
-
-    best_sc = _score(*_build_mesh(tris)[:2])
-    best = (pts, tris, best_sc)
-
-    for idx in list(rng.permutation(len(candidates)))[:min(len(candidates), 12)]:
-        ce, cfis = candidates[idx]
-        a, b = ce; ti0, ti1 = cfis
-        t0, t1 = tris[ti0], tris[ti1]
-        c_ = [v for v in t0 if v != a and v != b]
-        d_ = [v for v in t1 if v != a and v != b]
-        if not c_ or not d_: continue
-        c_, d_ = c_[0], d_[0]
-
-        vm = (pts[a] + pts[b]) / 2
-        nm = np.linalg.norm(vm)
-        if nm < 1e-10: continue
-        vm /= nm; vi = len(pts)
-
-        pts_try = np.vstack([pts, vm[None]])
-        tris_try = [t for i, t in enumerate(tris) if i not in (ti0, ti1)]
-        tris_try += [[a, vi, c_], [vi, b, c_], [a, d_, vi], [vi, d_, b]]
-
-        rng2 = np.random.RandomState(int(rng.randint(100000)))
-        for _pass in range(8):
-            tris_try, sc_try, deg_try = flip_pass(len(pts_try), tris_try, rng2)
-            if sc_try == 0: break
-            pts_try = spring_relax(pts_try, tris_try, 150)
-            try:
-                tris_try = triangulate(pts_try)
-            except Exception:
-                sc_try = 9999; break
-
-        if sc_try < best_sc:
-            best_sc = sc_try
-            best = (pts_try, tris_try, sc_try)
-            if verbose:
-                print(f'    split edge ({a},{b}): score -> {sc_try}')
-            if sc_try == 0:
-                break
-
-    return best
-
-
-def find_subdivision_params(n, m_min=27):
-    """Find (k, m) with n = k^2*(m+10)-10, k>=2, m>=m_min."""
-    results = []
-    k = 2
-    while k*k*(m_min+10) <= n + 10:
-        if (n+10) % (k*k) == 0:
-            m = (n+10)//(k*k) - 10
-            if m >= m_min:
-                results.append((k, m))
-        k += 1
-    return results
-
-
-def _exact_geo_h0(h):
-    ICO_FACES = [
-        [0,1,8],[0,8,4],[0,4,5],[0,5,9],[0,9,1],
-        [1,6,8],[8,6,10],[8,10,4],[4,10,2],[4,2,5],
-        [5,2,11],[5,11,9],[9,11,7],[9,7,1],[1,7,6],
-        [3,6,7],[3,7,11],[3,11,2],[3,2,10],[3,10,6],
-    ]
-    pts = []; vm = {}
-    def av(pt):
-        n2 = pt / np.linalg.norm(pt); k = tuple(np.round(n2, 14))
-        if k not in vm: vm[k] = len(pts); pts.append(n2)
-        return vm[k]
-    tris = []
-    for face in ICO_FACES:
-        A, B, C = _ICO[face[0]], _ICO[face[1]], _ICO[face[2]]
-        L = {}
-        for r in range(h+1):
-            for s in range(h+1-r): L[(r,s)] = av(r*A + s*B + (h-r-s)*C)
-        for r in range(h):
-            for s in range(h-r):
-                tris.append([L[(r,s)], L[(r+1,s)], L[(r,s+1)]])
-                if r+s+2 <= h: tris.append([L[(r+1,s)], L[(r+1,s+1)], L[(r,s+1)]])
-    return np.array(pts), tris
-
-
-def _dual_of_catalan(V, F):
-    nV = len(V)
-    ef = defaultdict(list)
-    for ti, f in enumerate(F):
-        k = len(f)
-        for j in range(k):
-            e = (min(f[j], f[(j+1)%k]), max(f[j], f[(j+1)%k]))
-            ef[e].append(ti)
-    vstar = defaultdict(list)
-    for ti, f in enumerate(F):
-        for v in f: vstar[v].append(ti)
-    dv = np.array([V[f].mean(0) for f in F])
-    dv /= np.linalg.norm(dv, axis=1, keepdims=True)
-    dual_F = []
-    for v in range(nV):
-        star = vstar.get(v, [])
-        if len(star) < 3: continue
-        nv = V[v]; ax = np.argmin(np.abs(nv))
-        x = np.zeros(3); x[ax] = 1.0; x -= np.dot(x,nv)*nv; x /= np.linalg.norm(x)
-        y = np.cross(nv, x)
-        angs = []
-        for fi in star:
-            c = dv[fi] - nv; c -= np.dot(c,nv)*nv
-            angs.append((np.arctan2(np.dot(c,y), np.dot(c,x)), fi))
-        angs.sort(); ordered = [fi for _,fi in angs]
-        fv = dv[ordered]; cen = fv.mean(0)
-        if np.dot(np.cross(fv[1]-fv[0], fv[2]-fv[0]), cen) < 0:
-            ordered = ordered[::-1]
-        dual_F.append(ordered)
-    return dv, dual_F
-
-
-def _fan_triangulate(V, F):
-    new_V = [v / np.linalg.norm(v) for v in V]; new_F = []
-    for f in F:
-        if len(f) == 3:
-            new_F.append(list(f))
-        else:
-            cen = np.array(new_V)[f].mean(0)
-            cen /= np.linalg.norm(cen)
-            ci = len(new_V); new_V.append(cen)
-            k = len(f)
-            for j in range(k): new_F.append([f[j], f[(j+1)%k], ci])
-    return np.array(new_V), new_F
-
-
-def _subdivide(V, F, k):
-    vm = {}; new_V = []
-    def gv(p):
-        n = p / np.linalg.norm(p); key = tuple(np.round(n, 10))
-        if key not in vm: vm[key] = len(new_V); new_V.append(n)
-        return vm[key]
-    new_F = []
-    for tri in F:
-        A, B, C = V[tri[0]], V[tri[1]], V[tri[2]]
-        L = {}
-        for i in range(k+1):
-            for j in range(k+1-i): L[(i,j,k-i-j)] = gv(i*A+j*B+(k-i-j)*C)
-        for i in range(k):
-            for j in range(k-i):
-                l = k-1-i-j
-                new_F.append([L[(i+1,j,l)], L[(i,j+1,l)], L[(i,j,l+1)]])
-                if i+j+1 < k: new_F.append([L[(i+1,j,l)], L[(i+1,j+1,l-1)], L[(i,j+1,l)]])
-    return np.array(new_V), new_F
-
-
-def merge_pyramids(pts, tris):
-    """Replace deg-4 and deg-5 pole vertices with quad/pentagon faces."""
-    deg = defaultdict(int)
-    for t in tris:
-        for v in t: deg[v] += 1
-
-    deg5 = [v for v, d in deg.items() if d == 5]
-    deg4 = [v for v, d in deg.items() if d == 4]
-
-    euler = 2*len(deg4) + len(deg5)
-    if euler != 12 and len(deg4) == 0 and len(deg5) > 12:
-        cand = pts[deg5]; used = set(); sel = []
-        for iv in _ICO:
-            ds = np.linalg.norm(cand - iv, axis=1)
-            for idx in np.argsort(ds):
-                if deg5[idx] not in used:
-                    used.add(deg5[idx]); sel.append(deg5[idx]); break
-        deg5 = sel
-    elif euler != 12:
-        print(f'  WARNING: Euler budget = {euler} (expected 12)')
-
-    vstar = defaultdict(list)
-    for ti, t in enumerate(tris):
-        for v in t: vstar[v].append(ti)
-
-    def ordered_ring(cap, star_tris):
-        nv = pts[cap]; ax = np.argmin(np.abs(nv))
-        x = np.zeros(3); x[ax] = 1.0; x -= np.dot(x,nv)*nv; x /= np.linalg.norm(x)
-        y = np.cross(nv, x)
-        angs = []
-        for ti in star_tris:
-            others = [v for v in tris[ti] if v != cap]
-            cen = pts[others].mean(0) - nv; cen -= np.dot(cen,nv)*nv
-            angs.append((np.arctan2(np.dot(cen,y), np.dot(cen,x)), ti))
-        angs.sort(); ordered = [ti for _,ti in angs]
-        ring = []
-        f0 = tris[ordered[0]]; o0 = [v for v in f0 if v != cap]
-        p0, p1 = pts[o0[0]], pts[o0[1]]
-        mid = (p0+p1)/2 - nv; mid -= np.dot(mid,nv)*nv
-        ed = p1-p0; ed -= np.dot(ed,nv)*nv
-        if np.dot(np.cross(nv,ed), mid) < 0: o0 = o0[::-1]
-        ring.append(o0[0])
-        for ti in ordered[1:]:
-            new = [v for v in tris[ti] if v != cap and v not in ring]
-            if new: ring.append(new[0])
-        return ring, ordered
-
-    removed = set(); polys = []
-
-    for cap in deg5:
-        ring, ordered = ordered_ring(cap, vstar[cap])
-        if len(ring) != 5:
-            ring = []
-            for ti in ordered:
-                for v in tris[ti]:
-                    if v != cap and v not in ring: ring.append(v)
-            ring = ring[:5]
-        polys.append(ring)
-        for ti in vstar[cap]: removed.add(ti)
-
-    for cap in deg4:
-        ring, ordered = ordered_ring(cap, vstar[cap])
-        if len(ring) != 4:
-            ring = []
-            for ti in ordered:
-                for v in tris[ti]:
-                    if v != cap and v not in ring: ring.append(v)
-            ring = ring[:4]
-        polys.append(ring)
-        for ti in vstar[cap]: removed.add(ti)
-
-    caps = set(deg5) | set(deg4); remap = {}; ni = 0
-    for v in range(len(pts)):
-        if v not in caps: remap[v] = ni; ni += 1
-    new_pts = np.array([pts[v] for v in range(len(pts)) if v not in caps])
-    new_tris = [[remap[v] for v in t] for i, t in enumerate(tris) if i not in removed]
-    new_polys = [[remap[v] for v in p] for p in polys]
-    return new_pts, new_tris + new_polys
-
-
-def take_dual(pts, tris):
-    n = len(pts)
-    dv = np.array([pts[t].mean(0) for t in tris])
-    dv /= np.linalg.norm(dv, axis=1, keepdims=True)
-    vstar = defaultdict(list)
-    for ti, t in enumerate(tris):
-        for v in t: vstar[v].append(ti)
-    dual_f = []
-    for v in range(n):
-        star = vstar.get(v, [])
-        if len(star) < 3: continue
-        nv = pts[v]; ax = np.argmin(np.abs(nv))
-        x = np.zeros(3); x[ax] = 1.0; x -= np.dot(x,nv)*nv; x /= np.linalg.norm(x)
-        y = np.cross(nv, x)
-        angs = []
-        for fi in star:
-            c = dv[fi] - nv; c -= np.dot(c,nv)*nv
-            angs.append((np.arctan2(np.dot(c,y), np.dot(c,x)), fi))
-        angs.sort(); ordered = [fi for _,fi in angs]
-        fv = dv[ordered]; cen = fv.mean(0)
-        if np.dot(np.cross(fv[1]-fv[0], fv[2]-fv[0]), cen) < 0:
-            ordered = ordered[::-1]
-        dual_f.append(ordered)
-    return dv, dual_f
-
-
-def stabilise(V, F, area_pull=0.20, verbose=True):
-    V = _flatten(V, F, verbose)
-    V, F = _midsphere(V, F, verbose)
-    V, F = _area_opt(V, F, area_pull, verbose)
-    return V, F
-
-
-def _flatten(V, F, verbose=True):
-    nV = len(V)
-    by_sz = defaultdict(list)
-    for f in F: by_sz[len(f)].append(f)
-    groups = [np.array(fs, dtype=int) for fs in by_sz.values() if fs]
-
-    def plan_obj(x, w):
-        V_ = x.reshape(nV, 3); G = np.zeros_like(V_); val = 0.0
-        for idx in groups:
-            if len(idx) == 0: continue
-            k = idx.shape[1]; pts = V_[idx]
-            cen = pts.mean(1, keepdims=True); d = pts - cen
-            dn = np.roll(d, -1, axis=1); raw = np.cross(d, dn).sum(1)
-            area = np.linalg.norm(raw, axis=1) / 2
-            nh = raw / (2*area[:,None]+1e-30)
-            proj = np.einsum('nki,ni->nk', d, nh)
-            val += w * float((proj**2).sum())
-            np.add.at(G, idx.reshape(-1),
-                      (2*w*proj[:,:,None]*nh[:,None,:]).reshape(-1, 3))
-        return float(val), G.flatten()
-
-    Vm = V.copy()
-    mp = float('inf')
-    for w in [1e3, 1e7, 1e11]:
-        res = minimize(lambda x: plan_obj(x, w), Vm.flatten(), jac=True,
-                       method='L-BFGS-B',
-                       options={'maxiter': 800, 'ftol': 1e-15, 'gtol': 1e-10})
-        Vm = res.x.reshape(nV, 3)
-        mp = max((np.linalg.svd(Vm[f]-Vm[f].mean(0), full_matrices=False)[1][-1]
-                  for f in F if len(f) >= 4), default=0)
-        if verbose:
-            print(f'  planarity w={w:.0e}: {mp:.2e}')
-        if mp < 1e-11: break
-    return Vm
-
-
-def _midsphere(V, F, verbose=True):
-    nV = len(V)
     edges = set()
-    for f in F:
-        k = len(f)
-        for j in range(k): edges.add((min(f[j],f[(j+1)%k]), max(f[j],f[(j+1)%k])))
-    edges = list(edges)
-    ea = np.array([e[0] for e in edges]); eb = np.array([e[1] for e in edges])
-
-    by_sz = defaultdict(list)
-    for f in F:
-        if len(f) >= 4: by_sz[len(f)].append(f)
-    groups = {k: np.array(v, dtype=int) for k, v in by_sz.items()}
-
-    def edge_d2(V_):
-        u = V_[ea]; v_ = V_[eb]; d = v_-u
-        dd = np.einsum('ij,ij->i', d, d).clip(1e-30)
-        t = -np.einsum('ij,ij->i', u, d) / dd
-        foot = u + t[:,None]*d
-        return np.einsum('ij,ij->i', foot, foot)
-
-    def recenter(V_):
-        u = V_[ea]; v_ = V_[eb]; d = v_-u
-        dd = np.einsum('ij,ij->i', d, d).clip(1e-30)
-        t = -np.einsum('ij,ij->i', u, d) / dd
-        return V_ - (u + t[:,None]*d).mean(0)
-
-    r = np.sqrt(np.median(edge_d2(V)))
-    if r > 1e-10: V = V / r
-    V = recenter(V)
-
-    for rnd, w_flat in enumerate([0, 1e2, 1e6, 1e10, 1e14, 1e16]):
-        def obj(x, _w=w_flat):
-            V_ = x.reshape(nV, 3); G = np.zeros_like(V_); val = 0.0
-            u = V_[ea]; v_ = V_[eb]; d = v_-u
-            dd = np.einsum('ij,ij->i', d, d).clip(1e-30)
-            t = -np.einsum('ij,ij->i', u, d) / dd
-            foot = u + t[:,None]*d; dist2 = np.einsum('ij,ij->i', foot, foot)
-            res = dist2 - 1.0; val += float(np.sum(res**2))
-            g_u = 2.0*res[:,None]*(1.0-t)[:,None]*foot*2
-            g_v = 2.0*res[:,None]*t[:,None]*foot*2
-            np.add.at(G, ea, g_u); np.add.at(G, eb, g_v)
-            if _w > 0:
-                for sz, idx in groups.items():
-                    k = idx.shape[1]; pts = V_[idx]
-                    cen = pts.mean(1, keepdims=True); d2 = pts-cen
-                    dn = np.roll(d2,-1,axis=1); raw = np.cross(d2,dn).sum(1)
-                    ar = np.linalg.norm(raw,axis=1)/2
-                    nh = raw/(2*ar[:,None]+1e-30)
-                    proj = np.einsum('nki,ni->nk', d2, nh)
-                    val += _w*float((proj**2).sum())
-                    np.add.at(G, idx.reshape(-1),
-                              (2*_w*proj[:,:,None]*nh[:,None,:]).reshape(-1,3))
-            return float(val), G.flatten()
-        res = minimize(obj, V.flatten(), jac=True, method='L-BFGS-B',
-                       options={'maxiter': 3000, 'ftol': 1e-20, 'gtol': 1e-12})
-        V = res.x.reshape(nV, 3); V = recenter(V)
-        d2 = edge_d2(V); r = np.sqrt(d2.mean())
-        if r > 1e-10: V = V / r
-        if verbose:
-            pls = [np.linalg.svd(V[f]-V[f].mean(0),full_matrices=False)[1][-1]
-                   for f in F if len(f)>=4]
-            print(f'  midsphere {rnd+1}: edge_std={np.sqrt(edge_d2(V)).std():.2e}  '
-                  f'plan={max(pls) if pls else 0:.2e}')
-
-    F_out = []
-    for f in F:
-        pts = V[f]; cen = pts.mean(0); d_ = pts-cen
-        dn = np.roll(d_,-1,axis=0); n = np.cross(d_,dn).sum(0)
-        if np.dot(n,cen) < 0: f = f[::-1]
-        F_out.append(list(f))
-    return V, F_out
+    for face in faces:
+        m = len(face)
+        for i in range(m):
+            a, b = face[i], face[(i + 1) % m]
+            edges.add((min(a, b), max(a, b)))
+    return grouped, np.array(sorted(edges), dtype=int)
 
 
-def _poly_area_grad(pts):
-    k = len(pts); cen = pts.mean(0); d = pts-cen
-    dn = np.roll(d,-1,axis=0); raw = np.cross(d,dn).sum(0)
-    nl = np.linalg.norm(raw)+1e-30; area=nl/2; nh=raw/nl
-    grad = np.array([np.cross(nh, pts[(j+1)%k]-pts[(j-1)%k])/2 for j in range(k)])
-    return area, grad
+def scatter_add(targets: np.ndarray, contributions: np.ndarray, n_vertices: int) -> np.ndarray:
+    """Accumulate per-incidence vector contributions onto their target vertices."""
+    out = np.empty((n_vertices, 3))
+    for axis in range(3):
+        out[:, axis] = np.bincount(targets, contributions[:, axis], minlength=n_vertices)
+    return out
 
 
-def _area_opt(V, F, area_pull=0.20, verbose=True):
-    nV = len(V); nF = len(F)
-    edges = set()
-    for f in F:
-        k = len(f)
-        for j in range(k): edges.add((min(f[j],f[(j+1)%k]),max(f[j],f[(j+1)%k])))
-    edges = list(edges)
-    ea = np.array([e[0] for e in edges]); eb = np.array([e[1] for e in edges])
+# ---------------------------------------------------------------------------
+# 2.  Spectral seed and midsphere canonicalisation
+# ---------------------------------------------------------------------------
 
-    by_sz = defaultdict(list)
-    for f in F: by_sz[len(f)].append(f)
-    groups = {k: np.array(v,dtype=int) for k,v in by_sz.items() if k>=4}
+def spectral_embedding(n_vertices: int, faces: Sequence[Face]) -> Embedding:
+    """Initial immersion of C(n) by the three lowest nonzero Laplacian modes.
 
-    def combined(x, wm, wa, wf, ws):
-        V_ = x.reshape(nV,3); G = np.zeros_like(V_); val = 0.0
-        u=V_[ea]; v_=V_[eb]; d=v_-u
-        dd=np.einsum('ij,ij->i',d,d).clip(1e-30)
-        t=-np.einsum('ij,ij->i',u,d)/dd; foot=u+t[:,None]*d
-        dist2=np.einsum('ij,ij->i',foot,foot); r2=dist2.mean()
-        res_m=dist2-r2; val+=wm*float(np.sum(res_m**2))
-        np.add.at(G,ea,2*wm*res_m[:,None]*2*(1-t)[:,None]*foot)
-        np.add.at(G,eb,2*wm*res_m[:,None]*2*t[:,None]*foot)
-        areas=np.zeros(nF); ags=[]
-        for fi,f in enumerate(F):
-            a,ag=_poly_area_grad(V_[f]); areas[fi]=a; ags.append(ag)
-        am=areas.mean(); res_a=areas-am; val+=wa*float(np.sum(res_a**2))
-        for fi,f in enumerate(F):
-            if abs(res_a[fi])<1e-15: continue
-            for j,vi in enumerate(f): G[vi]+=(2*wa*res_a[fi])*ags[fi][j]
-        for sz,idx in groups.items():
-            k=idx.shape[1]; pts=V_[idx]; cen=pts.mean(1,keepdims=True)
-            d2=pts-cen; dn=np.roll(d2,-1,axis=1); raw=np.cross(d2,dn).sum(1)
-            ar=np.linalg.norm(raw,axis=1)/2; nh=raw/(2*ar[:,None]+1e-30)
-            proj=np.einsum('nki,ni->nk',d2,nh); val+=wf*float((proj**2).sum())
-            np.add.at(G,idx.reshape(-1),(2*wf*proj[:,:,None]*nh[:,None,:]).reshape(-1,3))
-        if ws>0:
-            for f in F:
-                k=len(f); pts=V_[f]
-                sides=np.array([np.linalg.norm(pts[(j+1)%k]-pts[j]) for j in range(k)])
-                L=sides.mean(); res_s=sides-L; val+=ws*float(np.sum(res_s**2))
-                for j in range(k):
-                    diff=V_[f[(j+1)%k]]-V_[f[j]]; ln=np.linalg.norm(diff)+1e-15
-                    G[f[j]]+=(2*ws*res_s[j])*(-diff/ln); G[f[(j+1)%k]]+=(2*ws*res_s[j])*(diff/ln)
-        return float(val), G.flatten()
-
-    areas_init = np.array([_poly_area_grad(V[f])[0] for f in F])
-    if areas_init.std()/areas_init.mean() < 1e-6:
-        if verbose: print('  Areas already equal, skipping area optimisation')
-        return V, F
-
-    wm = 1e12; wa = area_pull*1e11; ws = 1e8
-    Vm = V.copy()
-
-    if verbose:
-        areas=np.array([_poly_area_grad(Vm[f])[0] for f in F])
-        u=Vm[ea]; v_=Vm[eb]; d=v_-u
-        dd=np.einsum('ij,ij->i',d,d).clip(1e-30)
-        t=-np.einsum('ij,ij->i',u,d)/dd; foot=Vm[ea]+t[:,None]*d
-        mid=np.sqrt(np.einsum('ij,ij->i',foot,foot))
-        print(f'  Before: mid_CV={mid.std()/mid.mean()*100:.3f}%  '
-              f'area_CV={areas.std()/areas.mean()*100:.2f}%')
-
-    for si, (wf, mi) in enumerate([(1e13,2000),(1e14,3000),(1e15,3000),(1e16,3000)]):
-        res = minimize(lambda x: combined(x,wm,wa,wf,ws), Vm.flatten(), jac=True,
-                       method='L-BFGS-B', options={'maxiter':mi,'ftol':1e-21,'gtol':1e-14})
-        Vm = res.x.reshape(nV,3)
-        if verbose:
-            areas=np.array([_poly_area_grad(Vm[f])[0] for f in F])
-            u=Vm[ea]; v_=Vm[eb]; d=v_-u
-            dd=np.einsum('ij,ij->i',d,d).clip(1e-30)
-            t=-np.einsum('ij,ij->i',u,d)/dd; foot=Vm[ea]+t[:,None]*d
-            mid=np.sqrt(np.einsum('ij,ij->i',foot,foot))
-            print(f'  Stage {si+1}: mid_CV={mid.std()/mid.mean()*100:.3f}%  '
-                  f'area_CV={areas.std()/areas.mean()*100:.2f}%')
-
-    F_out = []
-    for f in F:
-        pts=Vm[f]; cen=pts.mean(0); d_=pts-cen
-        dn=np.roll(d_,-1,axis=0); n=np.cross(d_,dn).sum(0)
-        if np.dot(n,cen)<0: f=f[::-1]
-        F_out.append(list(f))
-    return Vm, F_out
+    The graph Laplacian L = D - A of the edge graph is diagonalised; the eigenvectors of
+    the three smallest nonzero eigenvalues serve as Cartesian coordinates, and each
+    vertex is projected radially onto the unit sphere.
+    """
+    adjacency = np.zeros((n_vertices, n_vertices))
+    for face in faces:
+        m = len(face)
+        for i in range(m):
+            a, b = face[i], face[(i + 1) % m]
+            adjacency[a, b] = adjacency[b, a] = 1.0
+    laplacian = np.diag(adjacency.sum(1)) - adjacency
+    _, eigenvectors = np.linalg.eigh(laplacian)
+    coordinates = eigenvectors[:, 1:4]
+    return coordinates / np.linalg.norm(coordinates, axis=1, keepdims=True)
 
 
-_SEEDS = [42,7,1,13,53,79,97,101,23,61,37,83,17,31,41,43,47,59,67,71,
-          73,89,103,107,109,113,127,131,137,139,149,151,157,163,167,173,
-          179,181,191,193,197,199,211,223,227,229,233,239,241,251]
+def canonicalize_midsphere(vertices: Embedding, faces: Sequence[Face],
+                           iterations: int = 1800, rate: float = 0.35) -> Embedding:
+    """Drive an immersion towards the Koebe-Andreev-Thurston midsphere realisation.
+
+    Each iteration applies three averaged corrections: (i) planarisation, displacing every
+    vertex towards the mean plane of each incident face (Newell normals); (ii) tangency,
+    moving the endpoints of every edge so that the edge's nearest point to the origin
+    approaches the unit sphere; and (iii) recentring on the centroid of the edge-sphere
+    tangency points.  Corrections are accumulated by scatter-addition and damped by rate.
+    """
+    V = vertices.astype(float).copy()
+    n = len(V)
+    groups, edges = faces_by_size_and_edges(faces)
+    tail, head = edges[:, 0], edges[:, 1]
+    endpoints = np.concatenate([tail, head])
+
+    face_targets = {size: block.ravel() for size, block in groups.items()}
+    face_valence = (np.bincount(np.concatenate(list(face_targets.values())), minlength=n)
+                    if groups else np.ones(n))
+    edge_valence = np.bincount(endpoints, minlength=n)
+    face_valence = np.maximum(face_valence, 1)[:, None]
+    edge_valence = np.maximum(edge_valence, 1)[:, None]
+
+    for _ in range(iterations):
+        # (i) planarise each face onto its mean plane
+        correction = np.zeros((n, 3))
+        for size, block in groups.items():
+            points = V[block]
+            centroids = points.mean(1)
+            normals = np.zeros((len(block), 3))
+            for i in range(size):
+                normals += np.cross(points[:, i], points[:, (i + 1) % size])
+            normals /= np.linalg.norm(normals, axis=1, keepdims=True) + 1e-15
+            offset = np.einsum('msc,mc->ms', points - centroids[:, None, :], normals)
+            displacement = (-offset[:, :, None] * normals[:, None, :]).reshape(-1, 3)
+            correction += scatter_add(face_targets[size], displacement, n)
+        V = V + rate * correction / face_valence
+
+        # (ii) pull each edge towards tangency with the unit sphere
+        P, Q = V[tail], V[head]
+        direction = Q - P
+        t = np.clip(-np.einsum('ec,ec->e', P, direction) / np.einsum('ec,ec->e', direction, direction), 0, 1)
+        nearest = P + t[:, None] * direction
+        radius = np.linalg.norm(nearest, axis=1)
+        displacement = np.where((radius > 1e-9)[:, None],
+                                (1 - radius)[:, None] * (nearest / (radius[:, None] + 1e-15)),
+                                0.0)
+        correction = scatter_add(endpoints, np.concatenate([displacement, displacement]), n)
+        V = V + rate * correction / edge_valence
+
+        # (iii) recentre on the centroid of the edge-sphere tangency points
+        P, Q = V[tail], V[head]
+        direction = Q - P
+        t = np.clip(-np.einsum('ec,ec->e', P, direction) / np.einsum('ec,ec->e', direction, direction), 0, 1)
+        V = V - (P + t[:, None] * direction).mean(0)
+
+    return V
 
 
-def _search_primal(n_primal, target_score=0, max_time=300, verbose=True):
-    t0 = time.time()
-    best_sc = float('inf'); best_pts = None; best_tris = None
+# ---------------------------------------------------------------------------
+# 3.  Metrics
+# ---------------------------------------------------------------------------
 
-    phase1_budget = min(max_time * 0.30, 45.0)
-    seed_scores = []
+def face_metrics(vertices: Embedding, faces: Sequence[Face]) -> Dict[str, object]:
+    """Return the area ratio and insphere ratio of a canonical realisation.
 
-    for seed in _SEEDS:
-        if time.time() - t0 > phase1_budget:
-            break
-        ts_iters = min(700, max(400, n_primal * 2))
-        pts = fibonacci_sphere(n_primal, seed=seed)
-        pts = thomson(pts, ts_iters)
-        tris = triangulate(pts)
-        rng = np.random.RandomState(seed)
-        for _ in range(4):
-            tris, sc, deg = flip_pass(n_primal, tris, rng)
-        seed_scores.append((sc, seed, pts.copy(), list(tris)))
-        if verbose:
-            print(f'  [scan] seed={seed:3d}: score={sc}')
-        if sc <= target_score:
-            if verbose: print(f'  -> score=0 found in Phase 1!')
-            return pts, tris, sc
+    The coordinates are first rescaled so that the mean edge-sphere tangency radius is
+    one.  For each face the planar area (a fan triangulation about the centroid) and the
+    distance from the origin to the face plane are computed.  The result reports
+    rho = A_max / A_min, the insphere ratio min_f d_f / max_f d_f, and the face areas.
+    """
+    _, edges = faces_by_size_and_edges(faces)
+    P, Q = vertices[edges[:, 0]], vertices[edges[:, 1]]
+    direction = Q - P
+    t = np.clip(-np.einsum('ec,ec->e', P, direction) / np.einsum('ec,ec->e', direction, direction), 0, 1)
+    tangency_radius = np.linalg.norm(P + t[:, None] * direction, axis=1)
+    V = vertices / tangency_radius.mean()
 
-    seed_scores.sort(key=lambda x: x[0])
-    if verbose:
-        print(f'  Phase 1 done ({time.time()-t0:.0f}s). '
-              f'Best: {seed_scores[0][0]} (seed {seed_scores[0][1]}). '
-              f'Deep-diving top seeds...')
+    areas: List[float] = []
+    plane_distance: List[float] = []
+    for face in faces:
+        points = V[list(face)]
+        centroid = points.mean(0)
+        area = 0.0
+        normal = np.zeros(3)
+        m = len(face)
+        for i in range(m):
+            area += np.linalg.norm(np.cross(points[i] - centroid, points[(i + 1) % m] - centroid)) * 0.5
+            normal += np.cross(points[i], points[(i + 1) % m])
+        areas.append(area)
+        plane_distance.append(abs(np.dot(normal / (np.linalg.norm(normal) + 1e-15), centroid)))
 
-    n_deep = min(6, len(seed_scores))
-    for sc_init, seed, pts_init, tris_init in seed_scores[:n_deep]:
-        if time.time() - t0 > max_time:
-            if verbose: print(f'  (time limit {max_time}s reached)')
-            break
-
-        pts = pts_init.copy(); tris = list(tris_init)
-        rng = np.random.RandomState(seed)
-
-        for pi in range(40):
-            if time.time() - t0 > max_time: break
-            tris, sc, deg = flip_pass(n_primal, tris, rng)
-            if sc < best_sc:
-                best_sc = sc; best_pts = pts.copy(); best_tris = list(tris)
-                if verbose:
-                    print(f'  [deep] seed={seed:3d} iter={pi}: score={sc}  '
-                          f'deg={dict(Counter(deg.values()))}')
-            if best_sc <= target_score:
-                break
-            pts = spring_relax(pts, tris, 200)
-            tris = triangulate(pts)
-            if pi > 20 and sc == best_sc: break
-
-        if best_sc <= target_score:
-            break
-
-    return best_pts, best_tris, best_sc
-
-
-def build_via_subdivision(m, k, area_pull=0.20, verbose=True):
-    """Build n=k^2*(m+10)-10 faced Catalan via subdivision of an m-faced base."""
-    n = k*k*(m+10) - 10
-    if verbose: print(f'  Subdivision: m={m}, k={k} -> n={n}')
-
-    if verbose: print(f'  [1/4] Building base m={m}...')
-    V_m, F_m = _build_small_catalan(m, verbose=verbose)
-
-    if verbose: print(f'  [2/4] Dual of m={m} Catalan...')
-    V_d, F_d = _dual_of_catalan(V_m, F_m)
-
-    if verbose: print(f'  [3/4] Fan-triangulate + {k}-subdivision...')
-    V_d, F_d = _fan_triangulate(V_d, F_d)
-    V_s, F_s = _subdivide(V_d, F_d, k)
-
-    if verbose: print(f'  [4/4] Merge pyramids + dual...')
-    V_s, F_s = merge_pyramids(V_s, F_s)
-    V_n, F_n = take_dual(V_s, F_s)
-
-    fc = Counter(len(f) for f in F_n)
-    if verbose: print(f'  Result: {len(F_n)} faces: {dict(fc)}')
-    return V_n, F_n
-
-
-def _build_small_catalan(m, verbose=False):
-    h = 2
-    while 10*h*h - 10 < m: h += 1
-    if 10*h*h - 10 == m:
-        V_geo, tris_geo = _exact_geo_h0(h)
-        pts_m, tris_m = merge_pyramids(V_geo, tris_geo)
-        return take_dual(pts_m, tris_m)
-
-    sub = find_subdivision_params(m)
-    if sub:
-        k2, m2 = sub[0]
-        if verbose:
-            print(f'  [base] m={m} -> recursive sub k={k2}, m={m2}')
-        return build_via_subdivision(m2, k2, area_pull=0.0, verbose=verbose)
-
-    n_primal_m = m + 12
-    max_t = max(60, min(600, int(60 * (n_primal_m / 49) ** 2)))
-    if verbose and n_primal_m > 200:
-        print(f'  [base] Thomson at n={n_primal_m} (budget={max_t}s)...')
-    pts, tris, sc = _search_primal(n_primal_m, target_score=0,
-                                    max_time=max_t, verbose=verbose)
-    if sc > 0 and verbose:
-        print(f'  WARNING: base m={m} has score={sc}')
-    pts_m, tris_m = merge_pyramids(pts, tris)
-    return take_dual(pts_m, tris_m)
-
-
-_COLORS = {
-    'hexagon':   (180, 180, 190),
-    'shield':    ( 60,  80, 180),
-    'rhombus':   (180,  40,  40),
-    'trapezoid': ( 40, 160,  60),
-    'other':     (220, 120,  30),
-}
-
-
-def _classify_face(V, face):
-    k = len(face)
-    if k == 6: return 'hexagon'
-    if k == 5: return 'shield'
-    if k == 4:
-        pts = V[face]
-        edges = [np.linalg.norm(pts[(j+1)%4]-pts[j]) for j in range(4)]
-        if max(edges)/max(min(edges),1e-10) < 1.08: return 'rhombus'
-        return 'trapezoid'
-    return 'other'
-
-
-def write_off_colored(path, V, F):
-    types = [_classify_face(V, f) for f in F]
-    cnt = Counter(types)
-    areas = []
-    for f in F:
-        pts = V[f]; cen = pts.mean(0); d = pts-cen
-        dn = np.roll(d,-1,axis=0)
-        areas.append(np.linalg.norm(np.cross(d,dn).sum(0))/2)
-    total = sum(areas)
-    n = len(F); scale = np.sqrt(n / total) if total > 0 else 1.0
-    V_scaled = V * scale
-
-    with open(path, 'w') as fh:
-        fh.write(f'OFF\n{len(V_scaled)} {len(F)} 0\n')
-        for v in V_scaled:
-            fh.write(f'  {v[0]:.16f}  {v[1]:.16f}  {v[2]:.16f}\n')
-        for f, t in zip(F, types):
-            r, g, b = _COLORS.get(t, _COLORS['other'])
-            fh.write(str(len(f)) + ' ' + ' '.join(map(str, f)) +
-                     f'  {r} {g} {b}\n')
-    return cnt
-
-
-def quality_report(V, F):
-    edges = {}
-    for f in F:
-        k = len(f)
-        for j in range(k):
-            e = (min(f[j],f[(j+1)%k]),max(f[j],f[(j+1)%k]))
-            if e not in edges: edges[e]=np.linalg.norm(V[e[0]]-V[e[1]])
-    elen = np.array(list(edges.values()))
-    areas = []
-    for f in F:
-        pts=V[f]; cen=pts.mean(0); d=pts-cen
-        dn=np.roll(d,-1,axis=0)
-        areas.append(np.linalg.norm(np.cross(d,dn).sum(0))/2)
     areas = np.array(areas)
-    pls = []
-    for f in F:
-        if len(f)>=4:
-            _, s, _ = np.linalg.svd(V[f]-V[f].mean(0), full_matrices=False)
-            pls.append(s[-1])
-    vdeg = Counter(v for f in F for v in f)
-    bad = sum(1 for d in vdeg.values() if d not in (3,5))
-    print(f'  Faces:      {dict(Counter(len(f) for f in F))}')
-    print(f'  Vertex deg: {dict(Counter(vdeg.values()))}  bad={bad}')
-    print(f'  Edge CV:    {elen.std()/elen.mean()*100:.3f}%  '
-          f'min={elen.min():.4f}  max={elen.max():.4f}')
-    print(f'  Area CV:    {areas.std()/areas.mean()*100:.3f}%')
-    print(f'  Planarity:  {max(pls) if pls else 0:.2e}')
-    return bad
+    plane_distance = np.array(plane_distance)
+    return {'area_ratio': areas.max() / areas.min(),
+            'insphere_ratio': plane_distance.min() / plane_distance.max(),
+            'areas': areas}
 
 
-def run(n, out_path=None, area_pull=0.20, no_stabilise=False, verbose=True):
-    if n < 27:
-        print(f'ERROR: n must be at least 27. Got n={n}.')
-        sys.exit(1)
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
 
-    t0 = time.time()
-
-    if out_path is None:
-        desk = os.path.join(os.path.expanduser('~'), 'Desktop')
-        out_path = os.path.join(desk if os.path.isdir(desk) else '.', f'catalan_{n}.off')
-
-    print(f'\n{"="*62}')
-    print(f'  Catalan-like polyhedron: n={n}')
-    print(f'{"="*62}')
-
-    sub = find_subdivision_params(n)
-    if sub:
-        k, m = sub[0]
-        print(f'\n[SUBDIVISION] k={k}, m={m}  ->  n={n} (exact)')
-        V, F = build_via_subdivision(m, k, area_pull=area_pull, verbose=verbose)
-        n_actual = len(F)
-    else:
-        anchor_n = None; anchor_k = 0; anchor_sub = None; split_ok = False
-        for delta in range(1, 9):
-            sub_try = find_subdivision_params(n - delta)
-            if sub_try:
-                anchor_n = n - delta; anchor_k = delta; anchor_sub = sub_try[0]
-                break
-
-        anchor2_n = None; anchor2_sub = None
-        for delta in range(1, 9):
-            sub_try2 = find_subdivision_params(n + delta)
-            if sub_try2 and delta <= 4:
-                anchor2_n = n + delta; anchor2_sub = sub_try2[0]
-                break
-
-        max_time = 300
-
-        if anchor_n is not None:
-            k_sub, m_sub = anchor_sub
-            anchor_label = f"n'={anchor_n} (k={k_sub},m={m_sub})"
-            if anchor2_n is not None:
-                k2, m2 = anchor2_sub
-                anchor_label += f"; backup n''={anchor2_n} (k={k2},m={m2})"
-            print(f'\n[ANCHOR] {anchor_label},  {anchor_k} split(s) -> n={n}')
-
-            def _build_anchor_primal(n_anch, sub_params, verbose=False):
-                k_a, m_a = sub_params
-                V_a, F_a = build_via_subdivision(m_a, k_a, area_pull=area_pull,
-                                                  verbose=verbose)
-                V_da, F_da = _dual_of_catalan(V_a, F_a)
-                V_pta, F_pta = _fan_triangulate(V_da, F_da)
-                pts_a = np.array(V_pta)
-                tris_a = [list(f) for f in F_pta]
-                _, dm_a, _ = _build_mesh(tris_a)
-                return pts_a, tris_a, dm_a
-
-            pts_anchor, tris_anchor, dm_a = _build_anchor_primal(
-                anchor_n, anchor_sub, verbose=verbose)
-            ef_anchor, dm_a_check, _ = _build_mesh(tris_anchor)
-            assert _score(dm_a_check, ef_anchor) == 0, "anchor primal must be score=0"
-            if verbose:
-                print(f'  Anchor primal: {len(pts_anchor)} verts, '
-                      f'degrees={dict(Counter(dm_a.values()))}')
-
-            deg_a = dict(dm_a)
-            d5_set = set(v for v, d in deg_a.items() if d == 5)
-            d5_pos = pts_anchor[list(d5_set)]
-            ef_dict0 = defaultdict(list)
-            for ti, t in enumerate(tris_anchor):
-                for j in range(3):
-                    e = (min(t[j], t[(j+1)%3]), max(t[j], t[(j+1)%3]))
-                    ef_dict0[e].append(ti)
-            hh0 = [(e, fis) for e, fis in ef_dict0.items()
-                   if deg_a.get(e[0], 0)==6 and deg_a.get(e[1], 0)==6 and len(fis)==2]
-
-            def _pdist(edge, pts=pts_anchor, d5p=d5_pos):
-                mid = (pts[edge[0]] + pts[edge[1]]) / 2
-                mid /= np.linalg.norm(mid) + 1e-12
-                return float(np.min(np.linalg.norm(d5p - mid, axis=1)))
-
-            hh0.sort(key=lambda x: -_pdist(x[0]))
-
-            def _do_split(pts_in, tris_in, e, fis):
-                a, b = e; ti0, ti1 = fis
-                t0f = tris_in[ti0]; t1f = tris_in[ti1]
-                cf = [v for v in t0f if v != a and v != b]
-                df = [v for v in t1f if v != a and v != b]
-                if not cf or not df: return None, None
-                vm = (pts_in[a] + pts_in[b]) / 2
-                nm = np.linalg.norm(vm)
-                if nm < 1e-10: return None, None
-                vm /= nm; vi = len(pts_in)
-                pts_out = np.vstack([pts_in, vm[None]])
-                tris_out = [t for i, t in enumerate(tris_in) if i not in (ti0, ti1)]
-                tris_out += [[a,vi,cf[0]], [vi,b,cf[0]], [a,df[0],vi], [vi,df[0],b]]
-                return pts_out, tris_out
-
-            def _flip_clean(pts_in, tris_in, n_primal, seed, n_iter=40):
-                best_sc = float('inf')
-                best_pts = pts_in.copy(); best_tris = list(tris_in)
-                if n_primal < 450:
-                    offsets = [0, 3, 7, 13]
-                elif n_primal < 650:
-                    offsets = [0, 7]
-                else:
-                    offsets = [0]
-                for s_offset in offsets:
-                    rng = np.random.RandomState(seed + s_offset)
-                    pts_w = pts_in.copy(); tris_w = list(tris_in)
-                    for _ in range(n_iter):
-                        tris_w, sc, dm = flip_pass(n_primal, tris_w, rng)
-                        if sc < best_sc:
-                            best_sc = sc
-                            best_pts = pts_w.copy(); best_tris = list(tris_w)
-                        if best_sc == 0: break
-                        pts_w = spring_relax(pts_w, tris_w, 200)
-                        try: tris_w = triangulate(pts_w)
-                        except Exception: break
-                    if best_sc == 0: break
-                return best_pts, best_tris, best_sc
-
-            def _try_splits_from_anchor(pts_a, tris_a, hh_a, k_needed, n_target,
-                                         label=""):
-                pts_cur = pts_a.copy(); tris_cur = list(tris_a)
-
-                if k_needed == 1:
-                    for ei, (e_s, fis_s) in enumerate(hh_a):
-                        pts_t, tris_t = _do_split(pts_cur, tris_cur, e_s, fis_s)
-                        if pts_t is None: continue
-                        bp, bt, bs = _flip_clean(pts_t, tris_t, len(pts_t), ei*7)
-                        if bs == 0 and (len(bp)-12) == n_target:
-                            if verbose:
-                                print(f'  {label}Split 1 edge {ei}: score=0 \u2713')
-                            return bp, bt, True
-                    return None, None, False
-
-                elif k_needed == 2:
-                    for ei1, (e1, fis1) in enumerate(hh_a):
-                        pts_t1, tris_t1 = _do_split(pts_cur, tris_cur, e1, fis1)
-                        if pts_t1 is None: continue
-                        bp1, bt1, bs1 = _flip_clean(pts_t1, tris_t1, len(pts_t1),
-                                                     ei1*7, n_iter=20)
-                        if bs1 > 300: continue
-
-                        ef_t1 = defaultdict(list)
-                        for ti, t in enumerate(bt1):
-                            for j in range(3):
-                                e = (min(t[j],t[(j+1)%3]),max(t[j],t[(j+1)%3]))
-                                ef_t1[e].append(ti)
-                        dm_t1 = defaultdict(int)
-                        for t in bt1:
-                            for v in t: dm_t1[v]+=1
-                        d5_t1 = set(v for v,d in dm_t1.items() if d==5)
-                        d5p_t1 = bp1[list(d5_t1)] if d5_t1 else d5_pos
-                        hh1 = [(e,fis) for e,fis in ef_t1.items()
-                               if dm_t1.get(e[0],0)==6 and dm_t1.get(e[1],0)==6
-                               and len(fis)==2]
-                        hh1.sort(key=lambda x: -float(
-                            np.min(np.linalg.norm(d5p_t1 -
-                                   (bp1[x[0][0]]+bp1[x[0][1]])/2, axis=1))))
-
-                        for ei2, (e2, fis2) in enumerate(hh1):
-                            pts_t2, tris_t2 = _do_split(bp1, bt1, e2, fis2)
-                            if pts_t2 is None: continue
-                            bp2, bt2, bs2 = _flip_clean(
-                                pts_t2, tris_t2, len(pts_t2), ei2*7)
-                            if bs2 == 0 and (len(bp2)-12) == n_target:
-                                if verbose:
-                                    print(f'  {label}Splits ({ei1},{ei2}): score=0 \u2713')
-                                return bp2, bt2, True
-                    return None, None, False
-
-                else:
-                    for split_idx in range(k_needed):
-                        ef_c = defaultdict(list)
-                        for ti, t in enumerate(tris_cur):
-                            for j in range(3):
-                                e = (min(t[j],t[(j+1)%3]),max(t[j],t[(j+1)%3]))
-                                ef_c[e].append(ti)
-                        dm_c = defaultdict(int)
-                        for t in tris_cur:
-                            for v in t: dm_c[v]+=1
-                        d5c = set(v for v,d in dm_c.items() if d==5)
-                        d5p_c = pts_cur[list(d5c)] if d5c else d5_pos
-                        hh_c = [(e,fis) for e,fis in ef_c.items()
-                                if dm_c.get(e[0],0)==6 and dm_c.get(e[1],0)==6
-                                and len(fis)==2]
-                        hh_c.sort(key=lambda x: -float(
-                            np.min(np.linalg.norm(d5p_c -
-                                   (pts_cur[x[0][0]]+pts_cur[x[0][1]])/2,axis=1))))
-                        is_last = (split_idx == k_needed - 1)
-                        found = False
-                        for ei, (e_s, fis_s) in enumerate(hh_c):
-                            pts_t, tris_t = _do_split(pts_cur, tris_cur, e_s, fis_s)
-                            if pts_t is None: continue
-                            n_it = 40 if is_last else 20
-                            bp, bt, bs = _flip_clean(pts_t, tris_t, len(pts_t),
-                                                     ei*7, n_it)
-                            if is_last:
-                                if bs == 0 and (len(bp)-12) == n_target:
-                                    if verbose:
-                                        print(f'  {label}Split {split_idx+1} edge {ei}: \u2713')
-                                    pts_cur = bp; tris_cur = bt; found = True; break
-                                if bs == 50:
-                                    ef_r, dm_r, _ = _build_mesh(bt)
-                                    for rrs in [42, 7, 1, 13]:
-                                        rng_r = np.random.RandomState(rrs)
-                                        pr, tr, sr = vertex_split_repair(
-                                            bp, bt, dict(dm_r), rng_r)
-                                        if sr == 0 and (len(pr)-12) == n_target:
-                                            if verbose:
-                                                print(f'  {label}Split {split_idx+1} ' +
-                                                      f'edge {ei}+repair \u2713')
-                                            pts_cur = pr; tris_cur = tr
-                                            found = True; break
-                                    if found: break
-                            else:
-                                if bs <= 150:
-                                    pts_cur = bp; tris_cur = bt; found = True
-                                    if verbose:
-                                        print(f'  {label}Split {split_idx+1} edge {ei}: ' +
-                                              f'score={bs} (ok)')
-                                    break
-                        if not found: break
-                    ef_f, dm_f, _ = _build_mesh(tris_cur)
-                    if _score(dm_f, ef_f) == 0 and (len(pts_cur)-12) == n_target:
-                        return pts_cur, tris_cur, True
-                    return None, None, False
-
-            pts_final, tris_final, split_ok = _try_splits_from_anchor(
-                pts_anchor, tris_anchor, hh0, anchor_k, n, label="")
-
-            if not split_ok and anchor2_n is not None:
-                if verbose:
-                    k2, m2 = anchor2_sub
-                    print(f'  Primary failed. Trying backup anchor n\'\'={anchor2_n} '
-                          f'(k={k2},m={m2}), {anchor_k} splits...')
-                pts_a2, tris_a2, dm_a2 = _build_anchor_primal(
-                    anchor2_n, anchor2_sub, verbose=False)
-                ef_a2, dm_a2c, _ = _build_mesh(tris_a2)
-                if _score(dm_a2c, ef_a2) == 0:
-                    d5_a2 = set(v for v,d in dm_a2.items() if d==5)
-                    d5p_a2 = pts_a2[list(d5_a2)]
-                    ef_d2 = defaultdict(list)
-                    for ti, t in enumerate(tris_a2):
-                        for j in range(3):
-                            e=(min(t[j],t[(j+1)%3]),max(t[j],t[(j+1)%3]))
-                            ef_d2[e].append(ti)
-                    hh_a2 = [(e,fis) for e,fis in ef_d2.items()
-                              if dm_a2.get(e[0],0)==6 and dm_a2.get(e[1],0)==6
-                              and len(fis)==2]
-                    hh_a2.sort(key=lambda x: -float(
-                        np.min(np.linalg.norm(d5p_a2 -
-                               (pts_a2[x[0][0]]+pts_a2[x[0][1]])/2,axis=1))))
-                    pts_final, tris_final, split_ok = _try_splits_from_anchor(
-                        pts_a2, tris_a2, hh_a2, anchor_k, n, label="[bk] ")
-
-            if not split_ok and verbose:
-                print(f'  Anchor strategy exhausted, falling back to pure Thomson...')
-
-        if not split_ok:
-            print(f'\n[THOMSON] Pure Thomson fallback for n={n}...')
-            n_primal = n + 12
-            pts_final, tris_final, sc_final = _search_primal(
-                n_primal, target_score=50, max_time=max_time, verbose=verbose)
-
-            if sc_final > 0 and pts_final is not None:
-                ef_vs, dm_vs, _ = _build_mesh(tris_final)
-                bad_now = [v for v, d in dm_vs.items() if d not in (4,5,6)]
-                if bad_now:
-                    rng_vs = np.random.RandomState(31337)
-                    for _att in range(len(bad_now)*3):
-                        ef_c, dm_c, _ = _build_mesh(tris_final)
-                        if _score(dm_c, ef_c) == 0: break
-                        bn = [v for v,d in dm_c.items() if d not in (4,5,6)]
-                        if not bn: break
-                        pr, tr, sr = vertex_split_repair(pts_final, tris_final, dict(dm_c), rng_vs, verbose=verbose)
-                        if sr < sc_final:
-                            sc_final = sr; pts_final = pr; tris_final = tr
-                        else: break
-                        if sc_final == 0: break
-
-            n_actual_fallback = len(pts_final)-12 if pts_final is not None else n
-            if n_actual_fallback != n:
-                print(f'  NOTE: face count {n_actual_fallback} != requested {n}')
-
-        n_actual = len(pts_final) - 12
-        print(f'\n[DUAL] Building {n_actual}-faced Catalan-like...')
-        pts_m, tris_m = merge_pyramids(pts_final, tris_final)
-        V, F = take_dual(pts_m, tris_m)
-        fc = Counter(len(f) for f in F)
-        if verbose: print(f'  {len(F)} faces: {dict(fc)}')
-
-    if no_stabilise:
-        print('\n[SKIP] Stabilisation skipped (--no-stabilise)')
-    else:
-        print(f'\n[STABILISE] Planarity -> midsphere -> area...')
-        V, F = stabilise(V, F, area_pull=area_pull, verbose=verbose)
-
-    print(f'\n[QUALITY]')
-    bad = quality_report(V, F)
-
-    if bad > 0:
-        print(f'  WARNING: {bad} invalid vertex degrees remain.')
-
-    cnt = write_off_colored(out_path, V, F)
-    print(f'\n[OUTPUT] {out_path}')
-    print(f'  Colors:   shields={cnt.get("shield",0)}  '
-          f'hexagons={cnt.get("hexagon",0)}  '
-          f'rhombi={cnt.get("rhombus",0)}  '
-          f'traps={cnt.get("trapezoid",0)}')
-    if n_actual != n:
-        print(f'  Faces: {n_actual} (requested {n} -- vertex-split adjusted)')
-    print(f'  Time:  {time.time()-t0:.1f}s')
-
-    return V, F
+def write_off(path: str, vertices: Embedding, faces: Sequence[Sequence[int]]) -> None:
+    """Write a polyhedron to path in Object File Format (OFF)."""
+    V = np.asarray(vertices)
+    n_edges = sum(len(face) for face in faces) // 2
+    with open(path, 'w') as stream:
+        stream.write("OFF\n%d %d %d\n" % (len(V), len(faces), n_edges))
+        for point in V:
+            stream.write("%.10f %.10f %.10f\n" % (point[0], point[1], point[2]))
+        for face in faces:
+            stream.write("%d %s\n" % (len(face), " ".join(map(str, face))))
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description='Generate Catalan-like polyhedra for n >= 27')
-    parser.add_argument('n', type=int, nargs='?',
-                        help='Number of faces')
-    parser.add_argument('--output', '-o', help='Output .off file path')
-    parser.add_argument('--area-pull', type=float, default=0.20,
-                        help='Area equalisation strength 0-1 (default 0.20)')
-    parser.add_argument('--no-stabilise', action='store_true',
-                        help='Skip stabilisation steps (faster, lower quality)')
-    parser.add_argument('--quiet', action='store_true')
-    args = parser.parse_args()
+# ---------------------------------------------------------------------------
+# Catalogue of optimal source fullerenes
+#
+# CATALOGUE[n] is the face set of the IPR fullerene C_{2n+20} whose Catalan-like
+# polyhedron C(n) attains the minimal face-area ratio.  Each face is the cyclic
+# vertex sequence of a pentagon (length 5) or hexagon (length 6).
+# ---------------------------------------------------------------------------
 
-    if args.n is None:
-        while True:
-            try:
-                n = int(input('Number of faces n (>= 27): ').strip())
-                if n >= 27: break
-                print('  n must be at least 27.')
-            except ValueError:
-                print('  Please enter a whole number.')
-    else:
-        n = args.n
-
-    run(n, out_path=args.output, area_pull=args.area_pull,
-        no_stabilise=args.no_stabilise, verbose=not args.quiet)
+CATALOGUE: Dict[int, List[Face]] = {40: [[0, 2, 6, 12, 5, 1], [0, 3, 8, 15, 7, 2], [0, 1, 4, 9, 3], [1, 5, 11, 19, 10, 4], [2, 7, 14, 13, 6], [3, 9, 17, 26, 16, 8], [4, 10, 18, 27, 17, 9], [5, 12, 21, 31, 20, 11], [6, 13, 22, 32, 21, 12], [7, 15, 24, 35, 23, 14], [8, 16, 25, 36, 24, 15], [10, 19, 29, 41, 28, 18], [11, 20, 30, 42, 29, 19], [13, 14, 23, 34, 33, 22], [16, 26, 38, 51, 37, 25], [17, 27, 39, 52, 38, 26], [18, 28, 40, 39, 27], [20, 31, 44, 43, 30], [21, 32, 45, 57, 44, 31], [22, 33, 46, 58, 45, 32], [23, 35, 48, 47, 34], [24, 36, 49, 61, 48, 35], [25, 37, 50, 49, 36], [28, 41, 54, 66, 53, 40], [29, 42, 55, 67, 54, 41], [30, 43, 56, 68, 55, 42], [33, 34, 47, 60, 59, 46], [37, 51, 63, 76, 62, 50], [38, 52, 64, 63, 51], [39, 40, 53, 65, 64, 52], [43, 44, 57, 70, 69, 56], [45, 58, 71, 70, 57], [46, 59, 72, 82, 71, 58], [47, 48, 61, 74, 73, 60], [49, 50, 62, 75, 74, 61], [53, 66, 78, 87, 77, 65], [54, 67, 79, 88, 78, 66], [55, 68, 80, 79, 67], [56, 69, 81, 89, 80, 68], [59, 60, 73, 84, 83, 72], [62, 76, 86, 93, 85, 75], [63, 64, 65, 77, 86, 76], [69, 70, 71, 82, 90, 81], [72, 83, 91, 90, 82], [73, 74, 75, 85, 92, 84], [77, 87, 94, 99, 93, 86], [78, 88, 95, 94, 87], [79, 80, 89, 96, 95, 88], [81, 90, 91, 97, 96, 89], [83, 84, 92, 98, 97, 91], [85, 93, 99, 98, 92], [94, 95, 96, 97, 98, 99]], 41: [[0, 2, 6, 13, 5, 1], [0, 3, 8, 16, 7, 2], [0, 1, 4, 10, 9, 3], [1, 5, 12, 11, 4], [2, 7, 15, 24, 14, 6], [3, 9, 18, 28, 17, 8], [4, 11, 20, 30, 19, 10], [5, 13, 22, 33, 21, 12], [6, 14, 23, 34, 22, 13], [7, 16, 26, 38, 25, 15], [8, 17, 27, 26, 16], [9, 10, 19, 29, 18], [11, 12, 21, 32, 31, 20], [14, 24, 36, 35, 23], [15, 25, 37, 48, 36, 24], [17, 28, 40, 52, 39, 27], [18, 29, 41, 53, 40, 28], [19, 30, 42, 54, 41, 29], [20, 31, 43, 55, 42, 30], [21, 33, 45, 44, 32], [22, 34, 46, 58, 45, 33], [23, 35, 47, 59, 46, 34], [25, 38, 50, 49, 37], [26, 27, 39, 51, 50, 38], [31, 32, 44, 57, 56, 43], [35, 36, 48, 61, 60, 47], [37, 49, 62, 73, 61, 48], [39, 52, 64, 75, 63, 51], [40, 53, 65, 76, 64, 52], [41, 54, 66, 77, 65, 53], [42, 55, 67, 78, 66, 54], [43, 56, 68, 67, 55], [44, 45, 58, 70, 69, 57], [46, 59, 71, 81, 70, 58], [47, 60, 72, 71, 59], [49, 50, 51, 63, 74, 62], [56, 57, 69, 80, 79, 68], [60, 61, 73, 83, 82, 72], [62, 74, 84, 93, 83, 73], [63, 75, 85, 94, 84, 74], [64, 76, 86, 85, 75], [65, 77, 87, 95, 86, 76], [66, 78, 88, 87, 77], [67, 68, 79, 89, 88, 78], [69, 70, 81, 91, 90, 80], [71, 72, 82, 92, 91, 81], [79, 80, 90, 97, 96, 89], [82, 83, 93, 99, 98, 92], [84, 94, 100, 99, 93], [85, 86, 95, 101, 100, 94], [87, 88, 89, 96, 101, 95], [90, 91, 92, 98, 97], [96, 97, 98, 99, 100, 101]], 42: [[0, 2, 6, 12, 5, 1], [0, 3, 8, 15, 7, 2], [0, 1, 4, 9, 3], [1, 5, 11, 19, 10, 4], [2, 7, 14, 23, 13, 6], [3, 9, 17, 27, 16, 8], [4, 10, 18, 28, 17, 9], [5, 12, 21, 32, 20, 11], [6, 13, 22, 33, 21, 12], [7, 15, 25, 24, 14], [8, 16, 26, 37, 25, 15], [10, 19, 30, 42, 29, 18], [11, 20, 31, 43, 30, 19], [13, 23, 35, 48, 34, 22], [14, 24, 36, 49, 35, 23], [16, 27, 39, 53, 38, 26], [17, 28, 40, 39, 27], [18, 29, 41, 54, 40, 28], [20, 32, 45, 44, 31], [21, 33, 46, 59, 45, 32], [22, 34, 47, 46, 33], [24, 25, 37, 51, 50, 36], [26, 38, 52, 64, 51, 37], [29, 42, 56, 69, 55, 41], [30, 43, 57, 56, 42], [31, 44, 58, 70, 57, 43], [34, 48, 61, 74, 60, 47], [35, 49, 62, 75, 61, 48], [36, 50, 63, 62, 49], [38, 53, 66, 79, 65, 52], [39, 40, 54, 67, 66, 53], [41, 55, 68, 80, 67, 54], [44, 45, 59, 72, 71, 58], [46, 47, 60, 73, 72, 59], [50, 51, 64, 77, 76, 63], [52, 65, 78, 77, 64], [55, 69, 82, 92, 81, 68], [56, 57, 70, 83, 82, 69], [58, 71, 84, 93, 83, 70], [60, 74, 86, 85, 73], [61, 75, 87, 95, 86, 74], [62, 63, 76, 88, 87, 75], [65, 79, 90, 97, 89, 78], [66, 67, 80, 90, 79], [68, 81, 91, 97, 90, 80], [71, 72, 73, 85, 94, 84], [76, 77, 78, 89, 96, 88], [81, 92, 99, 103, 98, 91], [82, 83, 93, 99, 92], [84, 94, 100, 103, 99, 93], [85, 86, 95, 101, 100, 94], [87, 88, 96, 102, 101, 95], [89, 97, 91, 98, 102, 96], [98, 103, 100, 101, 102]], 43: [[0, 2, 6, 5, 1], [0, 3, 8, 15, 7, 2], [0, 1, 4, 10, 9, 3], [1, 5, 12, 20, 11, 4], [2, 7, 14, 23, 13, 6], [3, 9, 17, 27, 16, 8], [4, 11, 19, 18, 10], [5, 6, 13, 22, 21, 12], [7, 15, 25, 36, 24, 14], [8, 16, 26, 25, 15], [9, 10, 18, 29, 28, 17], [11, 20, 31, 42, 30, 19], [12, 21, 32, 43, 31, 20], [13, 23, 34, 46, 33, 22], [14, 24, 35, 47, 34, 23], [16, 27, 38, 51, 37, 26], [17, 28, 39, 52, 38, 27], [18, 19, 30, 41, 40, 29], [21, 22, 33, 45, 44, 32], [24, 36, 49, 63, 48, 35], [25, 26, 37, 50, 49, 36], [28, 29, 40, 54, 53, 39], [30, 42, 56, 69, 55, 41], [31, 43, 57, 70, 56, 42], [32, 44, 58, 57, 43], [33, 46, 60, 59, 45], [34, 47, 61, 73, 60, 46], [35, 48, 62, 61, 47], [37, 51, 65, 77, 64, 50], [38, 52, 66, 65, 51], [39, 53, 67, 78, 66, 52], [40, 41, 55, 68, 54], [44, 45, 59, 72, 71, 58], [48, 63, 75, 87, 74, 62], [49, 50, 64, 76, 75, 63], [53, 54, 68, 80, 79, 67], [55, 69, 81, 92, 80, 68], [56, 70, 82, 93, 81, 69], [57, 58, 71, 83, 82, 70], [59, 60, 73, 85, 84, 72], [61, 62, 74, 86, 85, 73], [64, 77, 89, 88, 76], [65, 66, 78, 90, 89, 77], [67, 79, 91, 99, 90, 78], [71, 72, 84, 95, 94, 83], [74, 87, 97, 96, 86], [75, 76, 88, 98, 97, 87], [79, 80, 92, 100, 91], [81, 93, 101, 104, 100, 92], [82, 83, 94, 101, 93], [84, 85, 86, 96, 102, 95], [88, 89, 90, 99, 103, 98], [91, 100, 104, 105, 103, 99], [94, 95, 102, 105, 104, 101], [96, 97, 98, 103, 105, 102]], 44: [[0, 2, 6, 5, 1], [0, 3, 8, 15, 7, 2], [0, 1, 4, 10, 9, 3], [1, 5, 12, 20, 11, 4], [2, 7, 14, 23, 13, 6], [3, 9, 17, 27, 16, 8], [4, 11, 19, 30, 18, 10], [5, 6, 13, 22, 21, 12], [7, 15, 25, 37, 24, 14], [8, 16, 26, 38, 25, 15], [9, 10, 18, 29, 28, 17], [11, 20, 32, 31, 19], [12, 21, 33, 45, 32, 20], [13, 23, 35, 48, 34, 22], [14, 24, 36, 35, 23], [16, 27, 40, 53, 39, 26], [17, 28, 41, 40, 27], [18, 30, 43, 56, 42, 29], [19, 31, 44, 57, 43, 30], [21, 22, 34, 47, 46, 33], [24, 37, 50, 64, 49, 36], [25, 38, 51, 65, 50, 37], [26, 39, 52, 51, 38], [28, 29, 42, 55, 54, 41], [31, 32, 45, 59, 58, 44], [33, 46, 60, 59, 45], [34, 48, 62, 75, 61, 47], [35, 36, 49, 63, 62, 48], [39, 53, 67, 80, 66, 52], [40, 41, 54, 68, 67, 53], [42, 56, 70, 69, 55], [43, 57, 71, 83, 70, 56], [44, 58, 72, 84, 71, 57], [46, 47, 61, 74, 73, 60], [49, 64, 77, 76, 63], [50, 65, 78, 89, 77, 64], [51, 52, 66, 79, 78, 65], [54, 55, 69, 82, 81, 68], [58, 59, 60, 73, 85, 72], [61, 75, 87, 86, 74], [62, 63, 76, 88, 87, 75], [66, 80, 91, 90, 79], [67, 68, 81, 92, 91, 80], [69, 70, 83, 94, 93, 82], [71, 84, 95, 94, 83], [72, 85, 96, 103, 95, 84], [73, 74, 86, 97, 96, 85], [76, 77, 89, 99, 98, 88], [78, 79, 90, 100, 99, 89], [81, 82, 93, 102, 101, 92], [86, 87, 88, 98, 104, 97], [90, 91, 92, 101, 105, 100], [93, 94, 95, 103, 106, 102], [96, 97, 104, 107, 106, 103], [98, 99, 100, 105, 107, 104], [101, 102, 106, 107, 105]], 45: [[0, 2, 6, 12, 5, 1], [0, 3, 8, 15, 7, 2], [0, 1, 4, 9, 3], [1, 5, 11, 19, 10, 4], [2, 7, 14, 23, 13, 6], [3, 9, 17, 27, 16, 8], [4, 10, 18, 28, 17, 9], [5, 12, 21, 20, 11], [6, 13, 22, 32, 21, 12], [7, 15, 25, 36, 24, 14], [8, 16, 26, 37, 25, 15], [10, 19, 30, 42, 29, 18], [11, 20, 31, 43, 30, 19], [13, 23, 34, 47, 33, 22], [14, 24, 35, 34, 23], [16, 27, 39, 38, 26], [17, 28, 40, 52, 39, 27], [18, 29, 41, 53, 40, 28], [20, 21, 32, 45, 44, 31], [22, 33, 46, 58, 45, 32], [24, 36, 49, 62, 48, 35], [25, 37, 50, 63, 49, 36], [26, 38, 51, 64, 50, 37], [29, 42, 55, 54, 41], [30, 43, 56, 69, 55, 42], [31, 44, 57, 70, 56, 43], [33, 47, 60, 59, 46], [34, 35, 48, 61, 60, 47], [38, 39, 52, 66, 65, 51], [40, 53, 67, 79, 66, 52], [41, 54, 68, 80, 67, 53], [44, 45, 58, 72, 71, 57], [46, 59, 73, 85, 72, 58], [48, 62, 75, 87, 74, 61], [49, 63, 76, 88, 75, 62], [50, 64, 77, 76, 63], [51, 65, 78, 89, 77, 64], [54, 55, 69, 82, 81, 68], [56, 70, 83, 82, 69], [57, 71, 84, 94, 83, 70], [59, 60, 61, 74, 86, 73], [65, 66, 79, 91, 90, 78], [67, 80, 92, 91, 79], [68, 81, 93, 101, 92, 80], [71, 72, 85, 95, 84], [73, 86, 96, 103, 95, 85], [74, 87, 97, 104, 96, 86], [75, 88, 98, 97, 87], [76, 77, 89, 99, 98, 88], [78, 90, 100, 105, 99, 89], [81, 82, 83, 94, 102, 93], [84, 95, 103, 107, 102, 94], [90, 91, 92, 101, 106, 100], [93, 102, 107, 109, 106, 101], [96, 104, 108, 109, 107, 103], [97, 98, 99, 105, 108, 104], [100, 106, 109, 108, 105]], 46: [[0, 2, 6, 13, 5, 1], [0, 3, 8, 7, 2], [0, 1, 4, 10, 9, 3], [1, 5, 12, 20, 11, 4], [2, 7, 15, 24, 14, 6], [3, 9, 17, 27, 16, 8], [4, 11, 19, 30, 18, 10], [5, 13, 22, 34, 21, 12], [6, 14, 23, 35, 22, 13], [7, 8, 16, 26, 25, 15], [9, 10, 18, 29, 28, 17], [11, 20, 32, 31, 19], [12, 21, 33, 45, 32, 20], [14, 24, 37, 50, 36, 23], [15, 25, 38, 51, 37, 24], [16, 27, 40, 53, 39, 26], [17, 28, 41, 40, 27], [18, 30, 43, 56, 42, 29], [19, 31, 44, 57, 43, 30], [21, 34, 47, 46, 33], [22, 35, 48, 61, 47, 34], [23, 36, 49, 48, 35], [25, 26, 39, 52, 38], [28, 29, 42, 55, 54, 41], [31, 32, 45, 59, 58, 44], [33, 46, 60, 72, 59, 45], [36, 50, 63, 76, 62, 49], [37, 51, 64, 77, 63, 50], [38, 52, 65, 78, 64, 51], [39, 53, 66, 79, 65, 52], [40, 41, 54, 67, 66, 53], [42, 56, 69, 68, 55], [43, 57, 70, 82, 69, 56], [44, 58, 71, 83, 70, 57], [46, 47, 61, 74, 73, 60], [48, 49, 62, 75, 74, 61], [54, 55, 68, 81, 80, 67], [58, 59, 72, 84, 71], [60, 73, 85, 95, 84, 72], [62, 76, 87, 97, 86, 75], [63, 77, 88, 87, 76], [64, 78, 89, 98, 88, 77], [65, 79, 90, 99, 89, 78], [66, 67, 80, 91, 90, 79], [68, 69, 82, 93, 92, 81], [70, 83, 94, 102, 93, 82], [71, 84, 95, 103, 94, 83], [73, 74, 75, 86, 96, 85], [80, 81, 92, 101, 100, 91], [85, 96, 104, 109, 103, 95], [86, 97, 105, 104, 96], [87, 88, 98, 106, 105, 97], [89, 99, 107, 110, 106, 98], [90, 91, 100, 107, 99], [92, 93, 102, 108, 101], [94, 103, 109, 111, 108, 102], [100, 101, 108, 111, 110, 107], [104, 105, 106, 110, 111, 109]], 47: [[0, 2, 6, 13, 5, 1], [0, 3, 8, 16, 7, 2], [0, 1, 4, 10, 9, 3], [1, 5, 12, 21, 11, 4], [2, 7, 15, 25, 14, 6], [3, 9, 18, 17, 8], [4, 11, 20, 31, 19, 10], [5, 13, 23, 22, 12], [6, 14, 24, 35, 23, 13], [7, 16, 27, 39, 26, 15], [8, 17, 28, 40, 27, 16], [9, 10, 19, 30, 29, 18], [11, 21, 33, 46, 32, 20], [12, 22, 34, 47, 33, 21], [14, 25, 37, 51, 36, 24], [15, 26, 38, 37, 25], [17, 18, 29, 42, 41, 28], [19, 31, 44, 58, 43, 30], [20, 32, 45, 44, 31], [22, 23, 35, 49, 48, 34], [24, 36, 50, 49, 35], [26, 39, 53, 66, 52, 38], [27, 40, 54, 67, 53, 39], [28, 41, 55, 54, 40], [29, 30, 43, 57, 56, 42], [32, 46, 60, 73, 59, 45], [33, 47, 61, 74, 60, 46], [34, 48, 62, 75, 61, 47], [36, 51, 64, 77, 63, 50], [37, 38, 52, 65, 64, 51], [41, 42, 56, 69, 68, 55], [43, 58, 71, 70, 57], [44, 45, 59, 72, 71, 58], [48, 49, 50, 63, 76, 62], [52, 66, 79, 91, 78, 65], [53, 67, 80, 92, 79, 66], [54, 55, 68, 81, 80, 67], [56, 57, 70, 83, 82, 69], [59, 73, 85, 96, 84, 72], [60, 74, 86, 97, 85, 73], [61, 75, 87, 86, 74], [62, 76, 88, 98, 87, 75], [63, 77, 89, 99, 88, 76], [64, 65, 78, 90, 89, 77], [68, 69, 82, 94, 93, 81], [70, 71, 72, 84, 95, 83], [78, 91, 101, 100, 90], [79, 92, 102, 110, 101, 91], [80, 81, 93, 102, 92], [82, 83, 95, 104, 103, 94], [84, 96, 105, 104, 95], [85, 97, 106, 112, 105, 96], [86, 87, 98, 107, 106, 97], [88, 99, 108, 107, 98], [89, 90, 100, 109, 108, 99], [93, 94, 103, 111, 110, 102], [100, 101, 110, 111, 113, 109], [103, 104, 105, 112, 113, 111], [106, 107, 108, 109, 113, 112]], 48: [[0, 2, 6, 12, 5, 1], [0, 3, 8, 15, 7, 2], [0, 1, 4, 9, 3], [1, 5, 11, 19, 10, 4], [2, 7, 14, 23, 13, 6], [3, 9, 17, 27, 16, 8], [4, 10, 18, 28, 17, 9], [5, 12, 21, 20, 11], [6, 13, 22, 32, 21, 12], [7, 15, 25, 36, 24, 14], [8, 16, 26, 37, 25, 15], [10, 19, 30, 42, 29, 18], [11, 20, 31, 43, 30, 19], [13, 23, 34, 47, 33, 22], [14, 24, 35, 34, 23], [16, 27, 39, 52, 38, 26], [17, 28, 40, 53, 39, 27], [18, 29, 41, 54, 40, 28], [20, 21, 32, 45, 44, 31], [22, 33, 46, 59, 45, 32], [24, 36, 49, 63, 48, 35], [25, 37, 50, 64, 49, 36], [26, 38, 51, 50, 37], [29, 42, 56, 55, 41], [30, 43, 57, 70, 56, 42], [31, 44, 58, 71, 57, 43], [33, 47, 61, 75, 60, 46], [34, 35, 48, 62, 61, 47], [38, 52, 66, 80, 65, 51], [39, 53, 67, 66, 52], [40, 54, 68, 81, 67, 53], [41, 55, 69, 82, 68, 54], [44, 45, 59, 73, 72, 58], [46, 60, 74, 73, 59], [48, 63, 77, 76, 62], [49, 64, 78, 90, 77, 63], [50, 51, 65, 79, 78, 64], [55, 56, 70, 84, 83, 69], [57, 71, 85, 96, 84, 70], [58, 72, 86, 85, 71], [60, 75, 88, 98, 87, 74], [61, 62, 76, 89, 88, 75], [65, 80, 92, 102, 91, 79], [66, 67, 81, 93, 92, 80], [68, 82, 94, 103, 93, 81], [69, 83, 95, 94, 82], [72, 73, 74, 87, 97, 86], [76, 77, 90, 100, 99, 89], [78, 79, 91, 101, 100, 90], [83, 84, 96, 105, 104, 95], [85, 86, 97, 106, 105, 96], [87, 98, 107, 113, 106, 97], [88, 89, 99, 108, 107, 98], [91, 102, 110, 109, 101], [92, 93, 103, 111, 110, 102], [94, 95, 104, 112, 111, 103], [99, 100, 101, 109, 114, 108], [104, 105, 106, 113, 115, 112], [107, 108, 114, 115, 113], [109, 110, 111, 112, 115, 114]], 49: [[0, 2, 6, 13, 5, 1], [0, 3, 8, 7, 2], [0, 1, 4, 10, 9, 3], [1, 5, 12, 20, 11, 4], [2, 7, 15, 24, 14, 6], [3, 9, 17, 27, 16, 8], [4, 11, 19, 30, 18, 10], [5, 13, 22, 34, 21, 12], [6, 14, 23, 35, 22, 13], [7, 8, 16, 26, 25, 15], [9, 10, 18, 29, 28, 17], [11, 20, 32, 45, 31, 19], [12, 21, 33, 32, 20], [14, 24, 37, 36, 23], [15, 25, 38, 50, 37, 24], [16, 27, 40, 39, 26], [17, 28, 41, 53, 40, 27], [18, 30, 43, 42, 29], [19, 31, 44, 56, 43, 30], [21, 34, 47, 60, 46, 33], [22, 35, 48, 61, 47, 34], [23, 36, 49, 62, 48, 35], [25, 26, 39, 52, 51, 38], [28, 29, 42, 55, 54, 41], [31, 45, 58, 72, 57, 44], [32, 33, 46, 59, 58, 45], [36, 37, 50, 64, 63, 49], [38, 51, 65, 78, 64, 50], [39, 40, 53, 67, 66, 52], [41, 54, 68, 81, 67, 53], [42, 43, 56, 70, 69, 55], [44, 57, 71, 70, 56], [46, 60, 74, 87, 73, 59], [47, 61, 75, 88, 74, 60], [48, 62, 76, 75, 61], [49, 63, 77, 89, 76, 62], [51, 52, 66, 80, 79, 65], [54, 55, 69, 83, 82, 68], [57, 72, 85, 97, 84, 71], [58, 59, 73, 86, 85, 72], [63, 64, 78, 91, 90, 77], [65, 79, 92, 91, 78], [66, 67, 81, 94, 93, 80], [68, 82, 95, 94, 81], [69, 70, 71, 84, 96, 83], [73, 87, 99, 98, 86], [74, 88, 100, 109, 99, 87], [75, 76, 89, 101, 100, 88], [77, 90, 102, 110, 101, 89], [79, 80, 93, 104, 103, 92], [82, 83, 96, 106, 105, 95], [84, 97, 107, 113, 106, 96], [85, 86, 98, 108, 107, 97], [90, 91, 92, 103, 111, 102], [93, 94, 95, 105, 112, 104], [98, 99, 109, 115, 114, 108], [100, 101, 110, 115, 109], [102, 111, 116, 114, 115, 110], [103, 104, 112, 117, 116, 111], [105, 106, 113, 117, 112], [107, 108, 114, 116, 117, 113]], 50: [[0, 2, 6, 13, 5, 1], [0, 3, 8, 16, 7, 2], [0, 1, 4, 10, 9, 3], [1, 5, 12, 21, 11, 4], [2, 7, 15, 14, 6], [3, 9, 18, 28, 17, 8], [4, 11, 20, 30, 19, 10], [5, 13, 23, 34, 22, 12], [6, 14, 24, 35, 23, 13], [7, 16, 26, 38, 25, 15], [8, 17, 27, 39, 26, 16], [9, 10, 19, 29, 18], [11, 21, 32, 45, 31, 20], [12, 22, 33, 32, 21], [14, 15, 25, 37, 36, 24], [17, 28, 41, 54, 40, 27], [18, 29, 42, 55, 41, 28], [19, 30, 43, 56, 42, 29], [20, 31, 44, 57, 43, 30], [22, 34, 47, 61, 46, 33], [23, 35, 48, 62, 47, 34], [24, 36, 49, 48, 35], [25, 38, 51, 65, 50, 37], [26, 39, 52, 66, 51, 38], [27, 40, 53, 52, 39], [31, 45, 59, 73, 58, 44], [32, 33, 46, 60, 59, 45], [36, 37, 50, 64, 63, 49], [40, 54, 68, 82, 67, 53], [41, 55, 69, 83, 68, 54], [42, 56, 70, 84, 69, 55], [43, 57, 71, 85, 70, 56], [44, 58, 72, 71, 57], [46, 61, 75, 74, 60], [47, 62, 76, 89, 75, 61], [48, 49, 63, 77, 76, 62], [50, 65, 79, 92, 78, 64], [51, 66, 80, 79, 65], [52, 53, 67, 81, 80, 66], [58, 73, 87, 99, 86, 72], [59, 60, 74, 88, 87, 73], [63, 64, 78, 91, 90, 77], [67, 82, 94, 105, 93, 81], [68, 83, 95, 106, 94, 82], [69, 84, 96, 95, 83], [70, 85, 97, 107, 96, 84], [71, 72, 86, 98, 97, 85], [74, 75, 89, 101, 100, 88], [76, 77, 90, 102, 101, 89], [78, 92, 104, 112, 103, 91], [79, 80, 81, 93, 104, 92], [86, 99, 109, 108, 98], [87, 88, 100, 110, 109, 99], [90, 91, 103, 111, 102], [93, 105, 113, 118, 112, 104], [94, 106, 114, 113, 105], [95, 96, 107, 115, 114, 106], [97, 98, 108, 116, 115, 107], [100, 101, 102, 111, 117, 110], [103, 112, 118, 119, 117, 111], [108, 109, 110, 117, 119, 116], [113, 114, 115, 116, 119, 118]], 51: [[0, 2, 6, 13, 5, 1], [0, 3, 8, 16, 7, 2], [0, 1, 4, 10, 9, 3], [1, 5, 12, 21, 11, 4], [2, 7, 15, 25, 14, 6], [3, 9, 18, 17, 8], [4, 11, 20, 31, 19, 10], [5, 13, 23, 35, 22, 12], [6, 14, 24, 23, 13], [7, 16, 27, 39, 26, 15], [8, 17, 28, 40, 27, 16], [9, 10, 19, 30, 29, 18], [11, 21, 33, 46, 32, 20], [12, 22, 34, 33, 21], [14, 25, 37, 50, 36, 24], [15, 26, 38, 51, 37, 25], [17, 18, 29, 42, 41, 28], [19, 31, 44, 58, 43, 30], [20, 32, 45, 44, 31], [22, 35, 48, 62, 47, 34], [23, 24, 36, 49, 48, 35], [26, 39, 53, 52, 38], [27, 40, 54, 67, 53, 39], [28, 41, 55, 68, 54, 40], [29, 30, 43, 57, 56, 42], [32, 46, 60, 73, 59, 45], [33, 34, 47, 61, 60, 46], [36, 50, 64, 77, 63, 49], [37, 51, 65, 78, 64, 50], [38, 52, 66, 79, 65, 51], [41, 42, 56, 69, 55], [43, 58, 71, 85, 70, 57], [44, 45, 59, 72, 71, 58], [47, 62, 75, 89, 74, 61], [48, 49, 63, 76, 75, 62], [52, 53, 67, 81, 80, 66], [54, 68, 82, 95, 81, 67], [55, 69, 83, 96, 82, 68], [56, 57, 70, 84, 83, 69], [59, 73, 87, 99, 86, 72], [60, 61, 74, 88, 87, 73], [63, 77, 91, 90, 76], [64, 78, 92, 103, 91, 77], [65, 79, 93, 92, 78], [66, 80, 94, 104, 93, 79], [70, 85, 98, 109, 97, 84], [71, 72, 86, 98, 85], [74, 89, 101, 100, 88], [75, 76, 90, 102, 101, 89], [80, 81, 95, 106, 105, 94], [82, 96, 107, 106, 95], [83, 84, 97, 108, 107, 96], [86, 99, 110, 117, 109, 98], [87, 88, 100, 111, 110, 99], [90, 91, 103, 113, 112, 102], [92, 93, 104, 114, 113, 103], [94, 105, 115, 119, 114, 104], [97, 109, 117, 120, 116, 108], [100, 101, 102, 112, 118, 111], [105, 106, 107, 108, 116, 115], [110, 111, 118, 121, 120, 117], [112, 113, 114, 119, 121, 118], [115, 116, 120, 121, 119]], 52: [[0, 2, 6, 13, 5, 1], [0, 3, 8, 16, 7, 2], [0, 1, 4, 10, 9, 3], [1, 5, 12, 21, 11, 4], [2, 7, 15, 25, 14, 6], [3, 9, 18, 29, 17, 8], [4, 11, 20, 31, 19, 10], [5, 13, 23, 35, 22, 12], [6, 14, 24, 23, 13], [7, 16, 27, 39, 26, 15], [8, 17, 28, 27, 16], [9, 10, 19, 30, 18], [11, 21, 33, 32, 20], [12, 22, 34, 45, 33, 21], [14, 25, 37, 49, 36, 24], [15, 26, 38, 50, 37, 25], [17, 29, 41, 54, 40, 28], [18, 30, 42, 55, 41, 29], [19, 31, 43, 56, 42, 30], [20, 32, 44, 57, 43, 31], [22, 35, 47, 61, 46, 34], [23, 24, 36, 48, 47, 35], [26, 39, 52, 66, 51, 38], [27, 28, 40, 53, 52, 39], [32, 33, 45, 59, 58, 44], [34, 46, 60, 73, 59, 45], [36, 49, 63, 76, 62, 48], [37, 50, 64, 77, 63, 49], [38, 51, 65, 64, 50], [40, 54, 68, 81, 67, 53], [41, 55, 69, 82, 68, 54], [42, 56, 70, 83, 69, 55], [43, 57, 71, 84, 70, 56], [44, 58, 72, 85, 71, 57], [46, 61, 75, 89, 74, 60], [47, 48, 62, 75, 61], [51, 66, 79, 93, 78, 65], [52, 53, 67, 80, 79, 66], [58, 59, 73, 87, 86, 72], [60, 74, 88, 87, 73], [62, 76, 90, 102, 89, 75], [63, 77, 91, 103, 90, 76], [64, 65, 78, 92, 91, 77], [67, 81, 95, 94, 80], [68, 82, 96, 107, 95, 81], [69, 83, 97, 96, 82], [70, 84, 98, 108, 97, 83], [71, 85, 99, 98, 84], [72, 86, 100, 109, 99, 85], [74, 89, 102, 111, 101, 88], [78, 93, 105, 113, 104, 92], [79, 80, 94, 106, 105, 93], [86, 87, 88, 101, 110, 100], [90, 103, 112, 119, 111, 102], [91, 92, 104, 112, 103], [94, 95, 107, 115, 114, 106], [96, 97, 108, 116, 115, 107], [98, 99, 109, 117, 116, 108], [100, 110, 118, 122, 117, 109], [101, 111, 119, 123, 118, 110], [104, 113, 120, 123, 119, 112], [105, 106, 114, 121, 120, 113], [114, 115, 116, 117, 122, 121], [118, 123, 120, 121, 122]], 55: [[0, 2, 6, 13, 5, 1], [0, 3, 8, 16, 7, 2], [0, 1, 4, 10, 9, 3], [1, 5, 12, 21, 11, 4], [2, 7, 15, 25, 14, 6], [3, 9, 18, 29, 17, 8], [4, 11, 20, 19, 10], [5, 13, 23, 22, 12], [6, 14, 24, 35, 23, 13], [7, 16, 27, 39, 26, 15], [8, 17, 28, 27, 16], [9, 10, 19, 31, 30, 18], [11, 21, 33, 45, 32, 20], [12, 22, 34, 46, 33, 21], [14, 25, 37, 50, 36, 24], [15, 26, 38, 37, 25], [17, 29, 41, 54, 40, 28], [18, 30, 42, 55, 41, 29], [19, 20, 32, 44, 43, 31], [22, 23, 35, 48, 47, 34], [24, 36, 49, 62, 48, 35], [26, 39, 52, 66, 51, 38], [27, 28, 40, 53, 52, 39], [30, 31, 43, 57, 56, 42], [32, 45, 59, 73, 58, 44], [33, 46, 60, 74, 59, 45], [34, 47, 61, 75, 60, 46], [36, 50, 64, 79, 63, 49], [37, 38, 51, 65, 64, 50], [40, 54, 68, 83, 67, 53], [41, 55, 69, 84, 68, 54], [42, 56, 70, 69, 55], [43, 44, 58, 72, 71, 57], [47, 48, 62, 77, 76, 61], [49, 63, 78, 77, 62], [51, 66, 81, 95, 80, 65], [52, 53, 67, 82, 81, 66], [56, 57, 71, 86, 85, 70], [58, 73, 88, 87, 72], [59, 74, 89, 102, 88, 73], [60, 75, 90, 89, 74], [61, 76, 91, 103, 90, 75], [63, 79, 93, 105, 92, 78], [64, 65, 80, 94, 93, 79], [67, 83, 97, 96, 82], [68, 84, 98, 109, 97, 83], [69, 70, 85, 99, 98, 84], [71, 72, 87, 101, 100, 86], [76, 77, 78, 92, 104, 91], [80, 95, 107, 106, 94], [81, 82, 96, 108, 107, 95], [85, 86, 100, 111, 110, 99], [87, 88, 102, 113, 112, 101], [89, 90, 103, 114, 113, 102], [91, 104, 115, 123, 114, 103], [92, 105, 116, 124, 115, 104], [93, 94, 106, 117, 116, 105], [96, 97, 109, 119, 118, 108], [98, 99, 110, 120, 119, 109], [100, 101, 112, 122, 121, 111], [106, 107, 108, 118, 125, 117], [110, 111, 121, 126, 120], [112, 113, 114, 123, 127, 122], [115, 124, 128, 127, 123], [116, 117, 125, 129, 128, 124], [118, 119, 120, 126, 129, 125], [121, 122, 127, 128, 129, 126]], 60: [[0, 2, 6, 13, 5, 1], [0, 3, 8, 16, 7, 2], [0, 1, 4, 10, 9, 3], [1, 5, 12, 21, 11, 4], [2, 7, 15, 25, 14, 6], [3, 9, 18, 29, 17, 8], [4, 11, 20, 31, 19, 10], [5, 13, 23, 22, 12], [6, 14, 24, 35, 23, 13], [7, 16, 27, 26, 15], [8, 17, 28, 39, 27, 16], [9, 10, 19, 30, 18], [11, 21, 33, 45, 32, 20], [12, 22, 34, 46, 33, 21], [14, 25, 37, 50, 36, 24], [15, 26, 38, 51, 37, 25], [17, 29, 41, 55, 40, 28], [18, 30, 42, 56, 41, 29], [19, 31, 43, 57, 42, 30], [20, 32, 44, 58, 43, 31], [22, 23, 35, 48, 47, 34], [24, 36, 49, 63, 48, 35], [26, 27, 39, 53, 52, 38], [28, 40, 54, 68, 53, 39], [32, 45, 60, 59, 44], [33, 46, 61, 75, 60, 45], [34, 47, 62, 76, 61, 46], [36, 50, 65, 64, 49], [37, 51, 66, 80, 65, 50], [38, 52, 67, 81, 66, 51], [40, 55, 70, 69, 54], [41, 56, 71, 85, 70, 55], [42, 57, 72, 86, 71, 56], [43, 58, 73, 87, 72, 57], [44, 59, 74, 88, 73, 58], [47, 48, 63, 78, 77, 62], [49, 64, 79, 93, 78, 63], [52, 53, 68, 83, 82, 67], [54, 69, 84, 98, 83, 68], [59, 60, 75, 90, 89, 74], [61, 76, 91, 105, 90, 75], [62, 77, 92, 91, 76], [64, 65, 80, 95, 94, 79], [66, 81, 96, 109, 95, 80], [67, 82, 97, 96, 81], [69, 70, 85, 100, 99, 84], [71, 86, 101, 113, 100, 85], [72, 87, 102, 101, 86], [73, 88, 103, 114, 102, 87], [74, 89, 104, 115, 103, 88], [77, 78, 93, 107, 106, 92], [79, 94, 108, 119, 107, 93], [82, 83, 98, 111, 110, 97], [84, 99, 112, 123, 111, 98], [89, 90, 105, 117, 116, 104], [91, 92, 106, 118, 117, 105], [94, 95, 109, 121, 120, 108], [96, 97, 110, 122, 121, 109], [99, 100, 113, 125, 124, 112], [101, 102, 114, 126, 125, 113], [103, 115, 127, 135, 126, 114], [104, 116, 128, 127, 115], [106, 107, 119, 130, 129, 118], [108, 120, 131, 130, 119], [110, 111, 123, 133, 132, 122], [112, 124, 134, 133, 123], [116, 117, 118, 129, 136, 128], [120, 121, 122, 132, 137, 131], [124, 125, 126, 135, 138, 134], [127, 128, 136, 139, 138, 135], [129, 130, 131, 137, 139, 136], [132, 133, 134, 138, 139, 137]], 20: [[0, 2, 6, 12, 5, 1], [0, 3, 8, 15, 7, 2], [0, 1, 4, 9, 3], [1, 5, 11, 19, 10, 4], [2, 7, 14, 13, 6], [3, 9, 17, 26, 16, 8], [4, 10, 18, 27, 17, 9], [5, 12, 21, 20, 11], [6, 13, 22, 31, 21, 12], [7, 15, 24, 34, 23, 14], [8, 16, 25, 24, 15], [10, 19, 29, 28, 18], [11, 20, 30, 39, 29, 19], [13, 14, 23, 33, 32, 22], [16, 26, 36, 46, 35, 25], [17, 27, 37, 36, 26], [18, 28, 38, 47, 37, 27], [20, 21, 31, 41, 40, 30], [22, 32, 42, 41, 31], [23, 34, 44, 43, 33], [24, 25, 35, 45, 44, 34], [28, 29, 39, 49, 48, 38], [30, 40, 50, 49, 39], [32, 33, 43, 52, 51, 42], [35, 46, 54, 53, 45], [36, 37, 47, 55, 54, 46], [38, 48, 56, 55, 47], [40, 41, 42, 51, 57, 50], [43, 44, 45, 53, 58, 52], [48, 49, 50, 57, 59, 56], [51, 52, 58, 59, 57], [53, 54, 55, 56, 59, 58]], 25: [[0, 2, 6, 12, 5, 1], [0, 3, 8, 15, 7, 2], [0, 1, 4, 9, 3], [1, 5, 11, 19, 10, 4], [2, 7, 14, 13, 6], [3, 9, 17, 26, 16, 8], [4, 10, 18, 27, 17, 9], [5, 12, 21, 20, 11], [6, 13, 22, 31, 21, 12], [7, 15, 24, 34, 23, 14], [8, 16, 25, 24, 15], [10, 19, 29, 28, 18], [11, 20, 30, 39, 29, 19], [13, 14, 23, 33, 32, 22], [16, 26, 36, 46, 35, 25], [17, 27, 37, 36, 26], [18, 28, 38, 47, 37, 27], [20, 21, 31, 41, 40, 30], [22, 32, 42, 51, 41, 31], [23, 34, 44, 53, 43, 33], [24, 25, 35, 45, 44, 34], [28, 29, 39, 49, 48, 38], [30, 40, 50, 58, 49, 39], [32, 33, 43, 52, 42], [35, 46, 55, 62, 54, 45], [36, 37, 47, 56, 55, 46], [38, 48, 57, 63, 56, 47], [40, 41, 51, 59, 50], [42, 52, 60, 65, 59, 51], [43, 53, 61, 66, 60, 52], [44, 45, 54, 61, 53], [48, 49, 58, 64, 57], [50, 59, 65, 68, 64, 58], [54, 62, 67, 69, 66, 61], [55, 56, 63, 67, 62], [57, 64, 68, 69, 67, 63], [60, 66, 69, 68, 65]], 27: [[0, 2, 6, 12, 5, 1], [0, 3, 8, 15, 7, 2], [0, 1, 4, 9, 3], [1, 5, 11, 19, 10, 4], [2, 7, 14, 13, 6], [3, 9, 17, 26, 16, 8], [4, 10, 18, 27, 17, 9], [5, 12, 21, 20, 11], [6, 13, 22, 31, 21, 12], [7, 15, 24, 34, 23, 14], [8, 16, 25, 24, 15], [10, 19, 29, 39, 28, 18], [11, 20, 30, 40, 29, 19], [13, 14, 23, 33, 32, 22], [16, 26, 36, 47, 35, 25], [17, 27, 37, 48, 36, 26], [18, 28, 38, 37, 27], [20, 21, 31, 42, 41, 30], [22, 32, 43, 53, 42, 31], [23, 34, 45, 55, 44, 33], [24, 25, 35, 46, 45, 34], [28, 39, 50, 60, 49, 38], [29, 40, 51, 50, 39], [30, 41, 52, 61, 51, 40], [32, 33, 44, 54, 43], [35, 47, 57, 65, 56, 46], [36, 48, 58, 57, 47], [37, 38, 49, 59, 58, 48], [41, 42, 53, 62, 52], [43, 54, 63, 69, 62, 53], [44, 55, 64, 70, 63, 54], [45, 46, 56, 64, 55], [49, 60, 67, 66, 59], [50, 51, 61, 68, 67, 60], [52, 62, 69, 72, 68, 61], [56, 65, 71, 73, 70, 64], [57, 58, 59, 66, 71, 65], [63, 70, 73, 72, 69], [66, 67, 68, 72, 73, 71]], 28: [[0, 2, 6, 12, 5, 1], [0, 3, 8, 15, 7, 2], [0, 1, 4, 9, 3], [1, 5, 11, 19, 10, 4], [2, 7, 14, 23, 13, 6], [3, 9, 17, 27, 16, 8], [4, 10, 18, 28, 17, 9], [5, 12, 21, 32, 20, 11], [6, 13, 22, 21, 12], [7, 15, 25, 24, 14], [8, 16, 26, 36, 25, 15], [10, 19, 30, 29, 18], [11, 20, 31, 41, 30, 19], [13, 23, 34, 45, 33, 22], [14, 24, 35, 46, 34, 23], [16, 27, 38, 50, 37, 26], [17, 28, 39, 38, 27], [18, 29, 40, 51, 39, 28], [20, 32, 43, 42, 31], [21, 22, 33, 44, 43, 32], [24, 25, 36, 48, 47, 35], [26, 37, 49, 48, 36], [29, 30, 41, 53, 52, 40], [31, 42, 54, 63, 53, 41], [33, 45, 56, 55, 44], [34, 46, 57, 65, 56, 45], [35, 47, 58, 57, 46], [37, 50, 60, 67, 59, 49], [38, 39, 51, 61, 60, 50], [40, 52, 62, 68, 61, 51], [42, 43, 44, 55, 64, 54], [47, 48, 49, 59, 66, 58], [52, 53, 63, 69, 62], [54, 64, 70, 74, 69, 63], [55, 56, 65, 71, 70, 64], [57, 58, 66, 72, 71, 65], [59, 67, 73, 75, 72, 66], [60, 61, 68, 73, 67], [62, 69, 74, 75, 73, 68], [70, 71, 72, 75, 74]], 29: [[0, 2, 6, 5, 1], [0, 3, 8, 15, 7, 2], [0, 1, 4, 10, 9, 3], [1, 5, 12, 20, 11, 4], [2, 7, 14, 23, 13, 6], [3, 9, 17, 27, 16, 8], [4, 11, 19, 18, 10], [5, 6, 13, 22, 21, 12], [7, 15, 25, 36, 24, 14], [8, 16, 26, 25, 15], [9, 10, 18, 29, 28, 17], [11, 20, 31, 42, 30, 19], [12, 21, 32, 43, 31, 20], [13, 23, 34, 45, 33, 22], [14, 24, 35, 34, 23], [16, 27, 38, 49, 37, 26], [17, 28, 39, 38, 27], [18, 19, 30, 41, 40, 29], [21, 22, 33, 44, 32], [24, 36, 47, 58, 46, 35], [25, 26, 37, 48, 47, 36], [28, 29, 40, 51, 50, 39], [30, 42, 53, 63, 52, 41], [31, 43, 54, 53, 42], [32, 44, 55, 64, 54, 43], [33, 45, 56, 65, 55, 44], [34, 35, 46, 57, 56, 45], [37, 49, 60, 59, 48], [38, 39, 50, 61, 60, 49], [40, 41, 52, 62, 51], [46, 58, 67, 66, 57], [47, 48, 59, 68, 67, 58], [50, 51, 62, 70, 69, 61], [52, 63, 71, 76, 70, 62], [53, 54, 64, 72, 71, 63], [55, 65, 73, 72, 64], [56, 57, 66, 74, 73, 65], [59, 60, 61, 69, 75, 68], [66, 67, 68, 75, 77, 74], [69, 70, 76, 77, 75], [71, 72, 73, 74, 77, 76]], 30: [[0, 2, 6, 13, 5, 1], [0, 3, 8, 7, 2], [0, 1, 4, 10, 9, 3], [1, 5, 12, 20, 11, 4], [2, 7, 15, 24, 14, 6], [3, 9, 17, 27, 16, 8], [4, 11, 19, 18, 10], [5, 13, 22, 21, 12], [6, 14, 23, 33, 22, 13], [7, 8, 16, 26, 25, 15], [9, 10, 18, 29, 28, 17], [11, 20, 31, 42, 30, 19], [12, 21, 32, 43, 31, 20], [14, 24, 35, 34, 23], [15, 25, 36, 47, 35, 24], [16, 27, 38, 49, 37, 26], [17, 28, 39, 38, 27], [18, 19, 30, 41, 40, 29], [21, 22, 33, 45, 44, 32], [23, 34, 46, 56, 45, 33], [25, 26, 37, 48, 36], [28, 29, 40, 51, 50, 39], [30, 42, 53, 63, 52, 41], [31, 43, 54, 53, 42], [32, 44, 55, 64, 54, 43], [34, 35, 47, 58, 57, 46], [36, 48, 59, 67, 58, 47], [37, 49, 60, 68, 59, 48], [38, 39, 50, 61, 60, 49], [40, 41, 52, 62, 51], [44, 45, 56, 65, 55], [46, 57, 66, 73, 65, 56], [50, 51, 62, 70, 69, 61], [52, 63, 71, 76, 70, 62], [53, 54, 64, 72, 71, 63], [55, 65, 73, 77, 72, 64], [57, 58, 67, 74, 66], [59, 68, 75, 78, 74, 67], [60, 61, 69, 75, 68], [66, 74, 78, 79, 77, 73], [69, 70, 76, 79, 78, 75], [71, 72, 77, 79, 76]], 31: [[0, 2, 6, 13, 5, 1], [0, 3, 8, 7, 2], [0, 1, 4, 10, 9, 3], [1, 5, 12, 20, 11, 4], [2, 7, 15, 24, 14, 6], [3, 9, 17, 27, 16, 8], [4, 11, 19, 18, 10], [5, 13, 22, 21, 12], [6, 14, 23, 33, 22, 13], [7, 8, 16, 26, 25, 15], [9, 10, 18, 29, 28, 17], [11, 20, 31, 42, 30, 19], [12, 21, 32, 43, 31, 20], [14, 24, 35, 34, 23], [15, 25, 36, 47, 35, 24], [16, 27, 38, 49, 37, 26], [17, 28, 39, 38, 27], [18, 19, 30, 41, 40, 29], [21, 22, 33, 45, 44, 32], [23, 34, 46, 56, 45, 33], [25, 26, 37, 48, 36], [28, 29, 40, 51, 50, 39], [30, 42, 53, 52, 41], [31, 43, 54, 64, 53, 42], [32, 44, 55, 65, 54, 43], [34, 35, 47, 58, 57, 46], [36, 48, 59, 68, 58, 47], [37, 49, 60, 69, 59, 48], [38, 39, 50, 61, 60, 49], [40, 41, 52, 63, 62, 51], [44, 45, 56, 66, 55], [46, 57, 67, 74, 66, 56], [50, 51, 62, 70, 61], [52, 53, 64, 72, 71, 63], [54, 65, 73, 72, 64], [55, 66, 74, 79, 73, 65], [57, 58, 68, 75, 67], [59, 69, 76, 80, 75, 68], [60, 61, 70, 77, 76, 69], [62, 63, 71, 78, 77, 70], [67, 75, 80, 81, 79, 74], [71, 72, 73, 79, 81, 78], [76, 77, 78, 81, 80]], 32: [[0, 2, 6, 5, 1], [0, 3, 8, 15, 7, 2], [0, 1, 4, 10, 9, 3], [1, 5, 12, 20, 11, 4], [2, 7, 14, 23, 13, 6], [3, 9, 17, 16, 8], [4, 11, 19, 29, 18, 10], [5, 6, 13, 22, 21, 12], [7, 15, 25, 36, 24, 14], [8, 16, 26, 37, 25, 15], [9, 10, 18, 28, 27, 17], [11, 20, 31, 30, 19], [12, 21, 32, 43, 31, 20], [13, 23, 34, 46, 33, 22], [14, 24, 35, 34, 23], [16, 17, 27, 39, 38, 26], [18, 29, 41, 40, 28], [19, 30, 42, 53, 41, 29], [21, 22, 33, 45, 44, 32], [24, 36, 48, 60, 47, 35], [25, 37, 49, 48, 36], [26, 38, 50, 61, 49, 37], [27, 28, 40, 52, 51, 39], [30, 31, 43, 55, 54, 42], [32, 44, 56, 55, 43], [33, 46, 58, 57, 45], [34, 35, 47, 59, 58, 46], [38, 39, 51, 63, 62, 50], [40, 41, 53, 65, 64, 52], [42, 54, 66, 74, 65, 53], [44, 45, 57, 68, 67, 56], [47, 60, 70, 77, 69, 59], [48, 49, 61, 71, 70, 60], [50, 62, 72, 71, 61], [51, 52, 64, 73, 63], [54, 55, 56, 67, 75, 66], [57, 58, 59, 69, 76, 68], [62, 63, 73, 79, 78, 72], [64, 65, 74, 80, 79, 73], [66, 75, 81, 80, 74], [67, 68, 76, 82, 81, 75], [69, 77, 83, 82, 76], [70, 71, 72, 78, 83, 77], [78, 79, 80, 81, 82, 83]], 33: [[0, 2, 6, 13, 5, 1], [0, 3, 8, 7, 2], [0, 1, 4, 10, 9, 3], [1, 5, 12, 20, 11, 4], [2, 7, 15, 24, 14, 6], [3, 9, 17, 27, 16, 8], [4, 11, 19, 18, 10], [5, 13, 22, 33, 21, 12], [6, 14, 23, 22, 13], [7, 8, 16, 26, 25, 15], [9, 10, 18, 29, 28, 17], [11, 20, 31, 42, 30, 19], [12, 21, 32, 31, 20], [14, 24, 35, 46, 34, 23], [15, 25, 36, 47, 35, 24], [16, 27, 38, 50, 37, 26], [17, 28, 39, 38, 27], [18, 19, 30, 41, 40, 29], [21, 33, 44, 56, 43, 32], [22, 23, 34, 45, 44, 33], [25, 26, 37, 49, 48, 36], [28, 29, 40, 52, 51, 39], [30, 42, 54, 65, 53, 41], [31, 32, 43, 55, 54, 42], [34, 46, 58, 68, 57, 45], [35, 47, 59, 58, 46], [36, 48, 60, 69, 59, 47], [37, 50, 62, 61, 49], [38, 39, 51, 63, 62, 50], [40, 41, 53, 64, 52], [43, 56, 67, 76, 66, 55], [44, 45, 57, 67, 56], [48, 49, 61, 71, 70, 60], [51, 52, 64, 73, 72, 63], [53, 65, 74, 81, 73, 64], [54, 55, 66, 75, 74, 65], [57, 68, 77, 83, 76, 67], [58, 59, 69, 78, 77, 68], [60, 70, 79, 78, 69], [61, 62, 63, 72, 80, 71], [66, 76, 83, 82, 75], [70, 71, 80, 85, 84, 79], [72, 73, 81, 85, 80], [74, 75, 82, 84, 85, 81], [77, 78, 79, 84, 82, 83]], 34: [[0, 2, 6, 13, 5, 1], [0, 3, 8, 16, 7, 2], [0, 1, 4, 10, 9, 3], [1, 5, 12, 21, 11, 4], [2, 7, 15, 14, 6], [3, 9, 18, 17, 8], [4, 11, 20, 30, 19, 10], [5, 13, 23, 34, 22, 12], [6, 14, 24, 35, 23, 13], [7, 16, 26, 38, 25, 15], [8, 17, 27, 39, 26, 16], [9, 10, 19, 29, 28, 18], [11, 21, 32, 31, 20], [12, 22, 33, 45, 32, 21], [14, 15, 25, 37, 36, 24], [17, 18, 28, 41, 40, 27], [19, 30, 43, 42, 29], [20, 31, 44, 56, 43, 30], [22, 34, 47, 46, 33], [23, 35, 48, 60, 47, 34], [24, 36, 49, 48, 35], [25, 38, 51, 63, 50, 37], [26, 39, 52, 51, 38], [27, 40, 53, 64, 52, 39], [28, 29, 42, 55, 54, 41], [31, 32, 45, 58, 57, 44], [33, 46, 59, 69, 58, 45], [36, 37, 50, 62, 61, 49], [40, 41, 54, 65, 53], [42, 43, 56, 67, 66, 55], [44, 57, 68, 78, 67, 56], [46, 47, 60, 71, 70, 59], [48, 49, 61, 72, 71, 60], [50, 63, 74, 73, 62], [51, 52, 64, 75, 74, 63], [53, 65, 76, 83, 75, 64], [54, 55, 66, 77, 76, 65], [57, 58, 69, 79, 68], [59, 70, 80, 85, 79, 69], [61, 62, 73, 82, 81, 72], [66, 67, 78, 84, 77], [68, 79, 85, 87, 84, 78], [70, 71, 72, 81, 80], [73, 74, 75, 83, 86, 82], [76, 77, 84, 87, 86, 83], [80, 81, 82, 86, 87, 85]], 35: [[0, 2, 6, 13, 5, 1], [0, 3, 8, 16, 7, 2], [0, 1, 4, 10, 9, 3], [1, 5, 12, 21, 11, 4], [2, 7, 15, 14, 6], [3, 9, 18, 28, 17, 8], [4, 11, 20, 19, 10], [5, 13, 23, 22, 12], [6, 14, 24, 34, 23, 13], [7, 16, 26, 37, 25, 15], [8, 17, 27, 26, 16], [9, 10, 19, 30, 29, 18], [11, 21, 32, 43, 31, 20], [12, 22, 33, 44, 32, 21], [14, 15, 25, 36, 35, 24], [17, 28, 39, 51, 38, 27], [18, 29, 40, 39, 28], [19, 20, 31, 42, 41, 30], [22, 23, 34, 46, 45, 33], [24, 35, 47, 58, 46, 34], [25, 37, 49, 61, 48, 36], [26, 27, 38, 50, 49, 37], [29, 30, 41, 53, 52, 40], [31, 43, 55, 67, 54, 42], [32, 44, 56, 55, 43], [33, 45, 57, 68, 56, 44], [35, 36, 48, 60, 59, 47], [38, 51, 63, 73, 62, 50], [39, 40, 52, 64, 63, 51], [41, 42, 54, 66, 65, 53], [45, 46, 58, 69, 57], [47, 59, 70, 78, 69, 58], [48, 61, 72, 80, 71, 60], [49, 50, 62, 72, 61], [52, 53, 65, 74, 64], [54, 67, 76, 84, 75, 66], [55, 56, 68, 77, 76, 67], [57, 69, 78, 85, 77, 68], [59, 60, 71, 79, 70], [62, 73, 81, 87, 80, 72], [63, 64, 74, 82, 81, 73], [65, 66, 75, 83, 82, 74], [70, 79, 86, 89, 85, 78], [71, 80, 87, 88, 86, 79], [75, 84, 89, 86, 88, 83], [76, 77, 85, 89, 84], [81, 82, 83, 88, 87]], 36: [[0, 2, 6, 5, 1], [0, 3, 8, 15, 7, 2], [0, 1, 4, 10, 9, 3], [1, 5, 12, 20, 11, 4], [2, 7, 14, 23, 13, 6], [3, 9, 17, 27, 16, 8], [4, 11, 19, 18, 10], [5, 6, 13, 22, 21, 12], [7, 15, 25, 36, 24, 14], [8, 16, 26, 37, 25, 15], [9, 10, 18, 29, 28, 17], [11, 20, 31, 43, 30, 19], [12, 21, 32, 44, 31, 20], [13, 23, 34, 46, 33, 22], [14, 24, 35, 34, 23], [16, 27, 39, 51, 38, 26], [17, 28, 40, 39, 27], [18, 19, 30, 42, 41, 29], [21, 22, 33, 45, 32], [24, 36, 48, 60, 47, 35], [25, 37, 49, 48, 36], [26, 38, 50, 61, 49, 37], [28, 29, 41, 53, 52, 40], [30, 43, 55, 66, 54, 42], [31, 44, 56, 67, 55, 43], [32, 45, 57, 68, 56, 44], [33, 46, 58, 69, 57, 45], [34, 35, 47, 59, 58, 46], [38, 51, 63, 62, 50], [39, 40, 52, 64, 63, 51], [41, 42, 54, 65, 53], [47, 60, 71, 81, 70, 59], [48, 49, 61, 72, 71, 60], [50, 62, 73, 82, 72, 61], [52, 53, 65, 75, 74, 64], [54, 66, 76, 84, 75, 65], [55, 67, 77, 76, 66], [56, 68, 78, 85, 77, 67], [57, 69, 79, 78, 68], [58, 59, 70, 80, 79, 69], [62, 63, 64, 74, 83, 73], [70, 81, 87, 91, 86, 80], [71, 72, 82, 87, 81], [73, 83, 88, 91, 87, 82], [74, 75, 84, 89, 88, 83], [76, 77, 85, 90, 89, 84], [78, 79, 80, 86, 90, 85], [86, 91, 88, 89, 90]], 37: [[0, 2, 6, 13, 5, 1], [0, 3, 8, 7, 2], [0, 1, 4, 10, 9, 3], [1, 5, 12, 20, 11, 4], [2, 7, 15, 24, 14, 6], [3, 9, 17, 27, 16, 8], [4, 11, 19, 30, 18, 10], [5, 13, 22, 21, 12], [6, 14, 23, 34, 22, 13], [7, 8, 16, 26, 25, 15], [9, 10, 18, 29, 28, 17], [11, 20, 32, 31, 19], [12, 21, 33, 44, 32, 20], [14, 24, 36, 48, 35, 23], [15, 25, 37, 36, 24], [16, 27, 39, 51, 38, 26], [17, 28, 40, 39, 27], [18, 30, 42, 54, 41, 29], [19, 31, 43, 55, 42, 30], [21, 22, 34, 46, 45, 33], [23, 35, 47, 59, 46, 34], [25, 26, 38, 50, 49, 37], [28, 29, 41, 53, 52, 40], [31, 32, 44, 57, 56, 43], [33, 45, 58, 70, 57, 44], [35, 48, 61, 73, 60, 47], [36, 37, 49, 62, 61, 48], [38, 51, 64, 75, 63, 50], [39, 40, 52, 65, 64, 51], [41, 54, 67, 66, 53], [42, 55, 68, 78, 67, 54], [43, 56, 69, 68, 55], [45, 46, 59, 71, 58], [47, 60, 72, 81, 71, 59], [49, 50, 63, 74, 62], [52, 53, 66, 77, 76, 65], [56, 57, 70, 80, 79, 69], [58, 71, 81, 89, 80, 70], [60, 73, 83, 82, 72], [61, 62, 74, 84, 83, 73], [63, 75, 85, 91, 84, 74], [64, 65, 76, 85, 75], [66, 67, 78, 87, 86, 77], [68, 69, 79, 88, 87, 78], [72, 82, 90, 93, 89, 81], [76, 77, 86, 92, 91, 85], [79, 80, 89, 93, 88], [82, 83, 84, 91, 92, 90], [86, 87, 88, 93, 90, 92]], 38: [[0, 2, 6, 5, 1], [0, 3, 8, 15, 7, 2], [0, 1, 4, 10, 9, 3], [1, 5, 12, 20, 11, 4], [2, 7, 14, 23, 13, 6], [3, 9, 17, 27, 16, 8], [4, 11, 19, 30, 18, 10], [5, 6, 13, 22, 21, 12], [7, 15, 25, 24, 14], [8, 16, 26, 37, 25, 15], [9, 10, 18, 29, 28, 17], [11, 20, 32, 44, 31, 19], [12, 21, 33, 45, 32, 20], [13, 23, 35, 47, 34, 22], [14, 24, 36, 48, 35, 23], [16, 27, 39, 52, 38, 26], [17, 28, 40, 39, 27], [18, 30, 42, 41, 29], [19, 31, 43, 55, 42, 30], [21, 22, 34, 46, 33], [24, 25, 37, 50, 49, 36], [26, 38, 51, 63, 50, 37], [28, 29, 41, 54, 53, 40], [31, 44, 57, 70, 56, 43], [32, 45, 58, 57, 44], [33, 46, 59, 71, 58, 45], [34, 47, 60, 72, 59, 46], [35, 48, 61, 73, 60, 47], [36, 49, 62, 61, 48], [38, 52, 65, 64, 51], [39, 40, 53, 66, 65, 52], [41, 42, 55, 68, 67, 54], [43, 56, 69, 68, 55], [49, 50, 63, 75, 74, 62], [51, 64, 76, 85, 75, 63], [53, 54, 67, 78, 77, 66], [56, 70, 80, 88, 79, 69], [57, 58, 71, 81, 80, 70], [59, 72, 82, 89, 81, 71], [60, 73, 83, 82, 72], [61, 62, 74, 84, 83, 73], [64, 65, 66, 77, 86, 76], [67, 68, 69, 79, 87, 78], [74, 75, 85, 91, 90, 84], [76, 86, 92, 95, 91, 85], [77, 78, 87, 92, 86], [79, 88, 93, 95, 92, 87], [80, 81, 89, 94, 93, 88], [82, 83, 84, 90, 94, 89], [90, 91, 95, 93, 94]], 39: [[0, 2, 6, 12, 5, 1], [0, 3, 8, 15, 7, 2], [0, 1, 4, 9, 3], [1, 5, 11, 19, 10, 4], [2, 7, 14, 23, 13, 6], [3, 9, 17, 27, 16, 8], [4, 10, 18, 28, 17, 9], [5, 12, 21, 20, 11], [6, 13, 22, 32, 21, 12], [7, 15, 25, 36, 24, 14], [8, 16, 26, 37, 25, 15], [10, 19, 30, 42, 29, 18], [11, 20, 31, 43, 30, 19], [13, 23, 34, 33, 22], [14, 24, 35, 47, 34, 23], [16, 27, 39, 38, 26], [17, 28, 40, 52, 39, 27], [18, 29, 41, 53, 40, 28], [20, 21, 32, 45, 44, 31], [22, 33, 46, 58, 45, 32], [24, 36, 49, 48, 35], [25, 37, 50, 62, 49, 36], [26, 38, 51, 63, 50, 37], [29, 42, 55, 68, 54, 41], [30, 43, 56, 55, 42], [31, 44, 57, 69, 56, 43], [33, 34, 47, 60, 59, 46], [35, 48, 61, 73, 60, 47], [38, 39, 52, 65, 64, 51], [40, 53, 66, 65, 52], [41, 54, 67, 78, 66, 53], [44, 45, 58, 71, 70, 57], [46, 59, 72, 71, 58], [48, 49, 62, 75, 74, 61], [50, 63, 76, 75, 62], [51, 64, 77, 86, 76, 63], [54, 68, 80, 79, 67], [55, 56, 69, 81, 80, 68], [57, 70, 82, 89, 81, 69], [59, 60, 73, 84, 83, 72], [61, 74, 85, 91, 84, 73], [64, 65, 66, 78, 87, 77], [67, 79, 88, 93, 87, 78], [70, 71, 72, 83, 90, 82], [74, 75, 76, 86, 92, 85], [77, 87, 93, 97, 92, 86], [79, 80, 81, 89, 94, 88], [82, 90, 95, 94, 89], [83, 84, 91, 96, 95, 90], [85, 92, 97, 96, 91], [88, 94, 95, 96, 97, 93]]}
 
 
-if __name__ == '__main__':
-    main()
+
+def main(argv: Sequence[str] = ()) -> None:
+    """Reconstruct the requested optimal C(n) and write their OFF files."""
+    output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best_offs")
+    os.makedirs(output_dir, exist_ok=True)
+
+    requested = [int(token) for token in argv] or sorted(CATALOGUE)
+    for n in requested:
+        if n not in CATALOGUE:
+            print(f"n = {n}: not in catalogue")
+            continue
+        n_vertices, faces, _ = construct_polytope(CATALOGUE[n])
+        vertices = canonicalize_midsphere(spectral_embedding(n_vertices, faces), faces, iterations=1800)
+        vertices = vertices / np.median(np.linalg.norm(vertices, axis=1))
+        metrics = face_metrics(vertices, faces)
+        filename = f"catalan_n{n}.off"
+        write_off(os.path.join(output_dir, filename), vertices, [list(face) for face in faces])
+        census = dict(sorted(Counter(len(face) for face in faces).items()))
+        print(f"n = {n:>2}:  rho = {metrics['area_ratio']:.4f}   face sizes {census}   ->  {filename}")
+    print("done ->", output_dir)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
