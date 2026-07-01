@@ -268,7 +268,7 @@ def main(argv: Sequence[str] = ()) -> None:
         r = sweep(n, buckygen=args.buckygen)
         print(_row(r), flush=True)
         if args.off:
-            write_off(os.path.join(args.off, f"catalan_n{n}.off"), r["vertices"], r["faces"])
+            write_off(os.path.join(args.off, f"catalan-like_n{n}.off"), r["vertices"], r["faces"])
 
 
 if __name__ == "__main__":
