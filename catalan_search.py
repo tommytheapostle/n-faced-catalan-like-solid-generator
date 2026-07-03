@@ -217,23 +217,30 @@ def sweep(n: int, iterations: int = 3000, buckygen: str = BUCKYGEN) -> Dict[str,
     Every admissible isomer is canonicalized (no pruning); the optimizer is then
     polished to machine precision and its point group computed.
     """
-    best = None
+    candidates = []
     for rotation in generate_ipr(n, buckygen):
         cn = admissible_cn(rotation)
         if cn is None:
             continue
         nv, faces = cn
         V = canonicalize_midsphere(spectral_embedding(nv, faces), faces, iterations)
-        rho = face_metrics(V, faces)["area_ratio"]
-        if best is None or rho < best[0]:
-            best = (rho, nv, faces)
-    if best is None:
+        candidates.append((face_metrics(V, faces)["area_ratio"], nv, faces))
+    if not candidates:
         raise RuntimeError(f"no admissible C({n})")
 
-    _, nv, faces = best
-    V = canonicalize_midsphere(spectral_embedding(nv, faces), faces, max(iterations, 6000))
-    V = polish(V, faces)
-    metrics = face_metrics(V, faces)
+    # Refine every near-minimum isomer to machine precision, then select the minimizer
+    # of rho; ties in rho are broken by greater symmetry order, then by greater iota.
+    lo = min(c[0] for c in candidates)
+    refined = []
+    for _, nv, faces in (c for c in candidates if c[0] - lo < 1e-3):
+        V = polish(canonicalize_midsphere(spectral_embedding(nv, faces), faces,
+                                          max(iterations, 6000)), faces)
+        m = face_metrics(V, faces)
+        order = len(_isometries(V - V.mean(0), faces))
+        refined.append((m["area_ratio"], order, m["insphere_ratio"], V, faces, m))
+    true_min = min(r[0] for r in refined)
+    tied = [r for r in refined if r[0] - true_min < 1e-6]
+    _, _, _, V, faces, metrics = max(tied, key=lambda r: (r[1], r[2]))
     return {
         "n": n,
         "source": 2 * n + 20,
@@ -268,7 +275,7 @@ def main(argv: Sequence[str] = ()) -> None:
         r = sweep(n, buckygen=args.buckygen)
         print(_row(r), flush=True)
         if args.off:
-            write_off(os.path.join(args.off, f"catalan-like_n{n}.off"), r["vertices"], r["faces"])
+            write_off(os.path.join(args.off, f"catalan_n{n}.off"), r["vertices"], r["faces"])
 
 
 if __name__ == "__main__":

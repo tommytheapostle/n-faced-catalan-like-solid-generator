@@ -46,6 +46,9 @@ rho_min(n) are therefore exhaustive minima over the admissible family. Each outp
 row lists n, the source fullerene, the point group, rho, the insphere ratio iota, and
 the optimizer's face-size vector.
 
+When several isomers attain the minimal rho (which among the achievable n happens
+only at n = 30), the one of greatest symmetry is reported, ties then broken by iota.
+
 The three isohedral cases n = 20, 30, 60 return rho = 1 exactly (icosahedron, rhombic
 triacontahedron, pentagonal hexecontahedron); the search reproduces this as a check.
 
