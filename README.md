@@ -75,7 +75,7 @@ Output is written to `best_offs/`.
 - **Point groups** are obtained from the graph automorphisms, realized as isometries of
   the canonical form (Mani's theorem) and classified into the Schoenflies symbol.
 - **Validation.** The canonicalizer returns rho = 1 exactly on the three isohedral
-  members, and each reported optimum is independent of the initial immersion to 1e-6
+  members, and each reported optimum is independent of the initial immersion to 1e-12
   or better.
 
 ## Attribution
