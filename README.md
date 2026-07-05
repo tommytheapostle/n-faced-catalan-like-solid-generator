@@ -10,7 +10,7 @@ polyhedra C(n) as OFF files.
 |------|---------|
 | `catalan_search.py` | Exhaustive search: for each n, enumerate all IPR fullerenes C_{2n+20}, construct C(n), canonicalize, and report the minimizer of the face-area ratio rho. This is the computation behind Table 1. |
 | `make_best_offs.py` | Regenerates the 30 optimal C(n) as OFF files from the tabulated optimal fullerenes, without needing buckygen. Shared geometry routines (construction, canonicalization) live here. |
-| `best_offs/` | The 30 optimal C(n) in OFF format (midsphere-canonical, Newton-polished to ~1e-14). |
+| `optimal_catalan-like_solutions/` | The 30 optimal C(n) in OFF format (midsphere-canonical, Newton-polished to ~1e-14). |
 
 ## Dependencies
 
